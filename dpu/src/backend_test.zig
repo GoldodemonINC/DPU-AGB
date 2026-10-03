@@ -16,6 +16,11 @@ test {
     // Pull in the tier ladder's own tests; they live next to the policy they
     // describe rather than in this integration file.
     _ = @import("tiers");
+    // Same for the server's routing table. Without this the dashboard's tests
+    // are dead code: `zig build test` only discovers tests in the root module
+    // and its relative imports, and nothing else in the backend touches the
+    // HTTP layer.
+    _ = @import("server.zig");
 }
 
 /// Scratch directory for the block device integration tests.

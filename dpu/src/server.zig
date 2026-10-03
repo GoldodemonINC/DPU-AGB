@@ -116,28 +116,17 @@ pub const Server = struct {
         const req = buf[0..@intCast(n)];
 
         const path = extractPath(req);
-        if (std.mem.eql(u8, path, "/api/telemetry")) {
-            sendTelemetry(client, ctx);
-        } else if (std.mem.eql(u8, path, "/api/control")) {
-            sendControl(client, req, ctx);
-        } else {
-            serveStatic(client, path);
-        }
-    }
+        const method = extractMethod(req);
 
-    fn sendResponse(client: c.SOCKET, status: []const u8, mime: []const u8, body: []const u8) void {
-        var head: [512]u8 = undefined;
-        const header = std.fmt.bufPrint(
-            &head,
-            "HTTP/1.1 {s}\r\n" ++
-                "Content-Type: {s}\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Cache-Control: no-store\r\n" ++
-                "Connection: close\r\n\r\n",
-            .{ status, mime, body.len },
-        ) catch return;
-        _ = c.send(client, header.ptr, @intCast(header.len), 0);
-        _ = c.send(client, body.ptr, @intCast(body.len), 0);
+        // `route` decides the status; the handlers below only build a body.
+        // Nothing a handler does can promote a miss into a success, because no
+        // handler holds a status to set.
+        switch (route(path, method)) {
+            .telemetry => sendTelemetry(client, ctx),
+            .control => sendControl(client, req, ctx),
+            .asset => serveAsset(client, path),
+            .reject => |r| respond(client, r.status, "text/plain", r.body, r.allow),
+        }
     }
 
     fn sendControl(client: c.SOCKET, req: []const u8, ctx: *Context) void {
@@ -155,7 +144,7 @@ pub const Server = struct {
         if (parseParam(req, "split")) |s| {
             ctx.engine.split = std.ascii.eqlIgnoreCase(s, "1") or std.ascii.eqlIgnoreCase(s, "true");
         }
-        sendResponse(client, "200 OK", "application/json", "{\"ok\":true}");
+        respond(client, "200 OK", "application/json", "{\"ok\":true}", null);
     }
 
     /// Build the telemetry payload by hand into a fixed buffer.
@@ -282,7 +271,7 @@ pub const Server = struct {
         }) catch return;
 
         w.writeAll("}") catch return;
-        sendResponse(client, "200 OK", "application/json", w.buffered());
+        respond(client, "200 OK", "application/json", w.buffered(), null);
     }
 };
 
@@ -299,6 +288,18 @@ pub const Context = struct {
     /// counters into a rate without owning a clock.
     last_sample_ms: i64 = 0,
 };
+
+/// Extract the method from an HTTP request line: `GET /path HTTP/1.1`.
+///
+/// The router used to dispatch on path alone, so `POST /api/telemetry` was
+/// served as a GET and `GET /api/control` reported `{"ok":true}` having done
+/// nothing. The verb is part of the route, not an optional detail on it.
+fn extractMethod(req: []const u8) []const u8 {
+    const line_end = std.mem.indexOfScalar(u8, req, '\n') orelse req.len;
+    const line = std.mem.trimEnd(u8, req[0..line_end], "\r ");
+    var it = std.mem.tokenizeAny(u8, line, " ");
+    return it.next() orelse "GET";
+}
 
 /// Extract the path from an HTTP request line: `GET /path HTTP/1.1`.
 fn extractPath(req: []const u8) []const u8 {
@@ -337,36 +338,226 @@ fn parseParam(req: []const u8, key: []const u8) ?[]const u8 {
 }
 
 // Static assets are embedded at compile time. The dashboard then ships inside
-// the binary: no asset directory to lose, no runtime file I/O, no 404s.
+// the binary: no asset directory to lose and no runtime file I/O. It does not
+// mean every request succeeds -- anything outside this set is a 404.
 const assets = @import("web_assets");
 const index_html = assets.index_html;
 const app_js = assets.app_js;
 const style_css = assets.style_css;
 
-fn serveStatic(client: c.SOCKET, path: []const u8) void {
-    if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
-        respond200(client, index_html, "text/html; charset=utf-8");
-    } else if (std.mem.eql(u8, path, "/app.js")) {
-        respond200(client, app_js, "application/javascript; charset=utf-8");
-    } else if (std.mem.eql(u8, path, "/style.css")) {
-        respond200(client, style_css, "text/css; charset=utf-8");
-    } else {
-        respond404(client);
+/// The dashboard's own files.
+///
+/// One table, read by both the router and the handler. Keeping the list of paths
+/// in the router and a second copy in the handler is how a path ends up routable
+/// but unservable, or served but unroutable -- two places that have to agree is
+/// the same failure this PR just removed from the status code.
+const Asset = struct { path: []const u8, mime: []const u8, body: []const u8 };
+
+const ASSETS = [_]Asset{
+    .{ .path = "/", .mime = "text/html; charset=utf-8", .body = index_html },
+    .{ .path = "/index.html", .mime = "text/html; charset=utf-8", .body = index_html },
+    .{ .path = "/app.js", .mime = "application/javascript; charset=utf-8", .body = app_js },
+    .{ .path = "/style.css", .mime = "text/css; charset=utf-8", .body = style_css },
+};
+
+fn findAsset(path: []const u8) ?Asset {
+    for (ASSETS) |a| {
+        if (std.mem.eql(u8, path, a.path)) return a;
     }
+    return null;
 }
 
-fn respond200(client: c.SOCKET, body: []const u8, mime: []const u8) void {
-    var head: [256]u8 = undefined;
-    const header = std.fmt.bufPrint(
-        &head,
-        "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n" ++
-            "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
-        .{ mime, body.len },
+/// What the router decided for one `(path, method)` pair.
+///
+/// A route is the pair, not the path alone: the verb is part of what the server
+/// offers for that path, so routing on the path alone let `DELETE /` answer with
+/// the dashboard and `GET /api/control` report `{"ok":true}` having written
+/// nothing.
+///
+/// The three payload-free tags are the ones that have a handler; only `.reject`
+/// carries a status, so a handler has no status to remember and a miss cannot be
+/// reported as a success.
+const Route = union(enum) {
+    /// Serve the telemetry document.
+    telemetry,
+    /// Apply a control write.
+    control,
+    /// Serve one of the embedded dashboard assets.
+    asset,
+    /// Refuse.
+    reject: Rejection,
+};
+
+/// Verbs a path accepts, as an `Allow` header value.
+///
+/// HEAD rides along with GET because a client asking for headers only is asking
+/// for the same resource. This server still writes the body for a HEAD, which
+/// RFC 9110 does not permit; splitting the two is a larger change than fixing
+/// the status code and is left deliberately undone rather than half-done.
+fn allowFor(want: []const u8) []const u8 {
+    return if (std.mem.eql(u8, want, "GET")) "GET, HEAD" else want;
+}
+
+/// Why a request is being refused, including everything the response needs.
+const Rejection = struct {
+    status: []const u8,
+    body: []const u8,
+    allow: ?[]const u8 = null,
+};
+
+/// Accept `method` for a route that serves `want`, or explain why not.
+fn accept(method: []const u8, want: []const u8) ?Rejection {
+    if (std.mem.eql(u8, method, want)) return null;
+    if (std.mem.eql(u8, want, "GET") and std.mem.eql(u8, method, "HEAD")) return null;
+    return .{
+        .status = "405 Method Not Allowed",
+        .body = "method not allowed\n",
+        .allow = allowFor(want),
+    };
+}
+
+/// The dashboard's own paths. Anything not in this list is a miss.
+fn isAssetPath(path: []const u8) bool {
+    return findAsset(path) != null;
+}
+
+/// The whole routing table, as one pure decision.
+///
+/// Every status this server can produce is named here, which is what makes the
+/// "200 for a missing route" bug unrepresentable rather than merely fixed: there
+/// is no path through this function that matches nothing and returns 200.
+fn route(path: []const u8, method: []const u8) Route {
+    if (std.mem.eql(u8, path, "/api/telemetry")) {
+        if (accept(method, "GET")) |why| return .{ .reject = why };
+        return .telemetry;
+    }
+    if (std.mem.eql(u8, path, "/api/control")) {
+        if (accept(method, "POST")) |why| return .{ .reject = why };
+        return .control;
+    }
+    if (isAssetPath(path)) {
+        if (accept(method, "GET")) |why| return .{ .reject = why };
+        return .asset;
+    }
+    return .{ .reject = .{ .status = "404 Not Found", .body = "not found\n" } };
+}
+
+fn serveAsset(client: c.SOCKET, path: []const u8) void {
+    // The router only dispatches here for a path present in ASSETS, so the
+    // unwrap cannot fail and this cannot silently serve the wrong file.
+    const a = findAsset(path).?;
+    respond(client, "200 OK", a.mime, a.body, null);
+}
+
+/// The single response emitter. Every status line in this server is written
+/// here, so "which code does this return" has one answer rather than one per
+/// helper that happens to remember.
+fn respond(client: c.SOCKET, status: []const u8, mime: []const u8, body: []const u8, allow: ?[]const u8) void {
+    var head: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&head);
+    w.print(
+        "HTTP/1.1 {s}\r\n" ++
+            "Content-Type: {s}\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Cache-Control: no-store\r\n" ++
+            "Connection: close\r\n",
+        .{ status, mime, body.len },
     ) catch return;
-    _ = c.send(client, header.ptr, @intCast(header.len), 0);
+    // RFC 9110 requires Allow on a 405; harmless anywhere else, so it is only
+    // written when the router supplied one.
+    if (allow) |a| w.print("Allow: {s}\r\n", .{a}) catch return;
+    w.writeAll("\r\n") catch return;
+
+    const out = w.buffered();
+    _ = c.send(client, out.ptr, @intCast(out.len), 0);
     _ = c.send(client, body.ptr, @intCast(body.len), 0);
 }
 
-fn respond404(client: c.SOCKET) void {
-    respond200(client, "not found", "text/plain");
+// ---------------------------------------------------------------------- tests
+//
+// The routing table is pure, so it is worth asserting directly: the 200-for-a-
+// missing-route bug shipped because the dispatch was an `if/else` chain with no
+// statement anywhere saying what a miss returns. These tests say it out loud,
+// and the wire check in the PR description is what says the socket agrees.
+
+const testing = std.testing;
+
+fn statusOf(r: Route) ?[]const u8 {
+    return switch (r) {
+        .reject => |why| why.status,
+        else => null,
+    };
+}
+
+test "a path that serves nothing is 404, not 200" {
+    const r = route("/nope", "GET");
+    try testing.expectEqualStrings("404 Not Found", statusOf(r).?);
+    try testing.expectEqualStrings("not found\n", r.reject.body);
+    // A miss must not advertise a verb list: there is nothing there to allow.
+    try testing.expect(r.reject.allow == null);
+}
+
+test "browser and crawler paths that do not exist are 404" {
+    for ([_][]const u8{ "/favicon.ico", "/app.js.map", "/index.htm", "/API/telemetry", "/api/telemetry/", "api/telemetry", "" }) |p| {
+        try testing.expectEqualStrings("404 Not Found", statusOf(route(p, "GET")).?);
+    }
+}
+
+test "every dashboard path still routes" {
+    try testing.expectEqual(std.meta.activeTag(route("/api/telemetry", "GET")), .telemetry);
+    try testing.expectEqual(std.meta.activeTag(route("/api/control", "POST")), .control);
+    try testing.expectEqual(std.meta.activeTag(route("/", "GET")), .asset);
+    try testing.expectEqual(std.meta.activeTag(route("/index.html", "GET")), .asset);
+    try testing.expectEqual(std.meta.activeTag(route("/app.js", "GET")), .asset);
+    try testing.expectEqual(std.meta.activeTag(route("/style.css", "GET")), .asset);
+}
+
+test "the wrong verb on a real route is 405 with Allow" {
+    // The bug this PR fixes: the verb was not part of the route at all, so
+    // `DELETE /` answered with the whole dashboard and `GET /api/control`
+    // claimed a write it never performed.
+    const d = route("/", "DELETE");
+    try testing.expectEqualStrings("405 Method Not Allowed", statusOf(d).?);
+    try testing.expectEqualStrings("GET, HEAD", d.reject.allow.?);
+
+    try testing.expectEqualStrings("405 Method Not Allowed", statusOf(route("/app.js", "PUT")).?);
+    try testing.expectEqualStrings("405 Method Not Allowed", statusOf(route("/api/control", "GET")).?);
+    try testing.expectEqualStrings("405 Method Not Allowed", statusOf(route("/api/telemetry", "POST")).?);
+}
+
+test "POST on a GET-only route never reaches a handler" {
+    // Belt and braces: a 405 on the telemetry path must not carry a payload.
+    const r = route("/api/telemetry", "PUT");
+    try testing.expectEqualStrings("405 Method Not Allowed", statusOf(r).?);
+    try testing.expectEqualStrings("GET, HEAD", r.reject.allow.?);
+    try testing.expectEqualStrings("method not allowed\n", r.reject.body);
+}
+
+test "the control route does not answer GET" {
+    // Only the verb guard can stop this; there is no body check behind it.
+    try testing.expectEqualStrings("405 Method Not Allowed", statusOf(route("/api/control", "GET")).?);
+    try testing.expectEqualStrings("POST", route("/api/control", "GET").reject.allow.?);
+}
+
+test "HEAD is accepted wherever GET is" {
+    for ([_][]const u8{ "/", "/index.html", "/app.js", "/style.css", "/api/telemetry" }) |p| {
+        try testing.expect(statusOf(route(p, "HEAD")) == null);
+    }
+}
+
+test "the method comes off the request line" {
+    try testing.expectEqualStrings("GET", extractMethod("GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
+    try testing.expectEqualStrings("POST", extractMethod("POST /api/control HTTP/1.1\r\n\r\n"));
+    try testing.expectEqualStrings("DELETE", extractMethod("DELETE / HTTP/1.1\r\n\r\n"));
+}
+
+test "the path drops the query string" {
+    try testing.expectEqualStrings("/api/telemetry", extractPath("GET /api/telemetry?x=1 HTTP/1.1\r\n\r\n"));
+    try testing.expectEqualStrings("/", extractPath("GET /?x=1 HTTP/1.1\r\n\r\n"));
+}
+
+test "no verb reaches a handler for a path that does not exist" {
+    for ([_][]const u8{ "GET", "POST", "HEAD", "PUT", "DELETE" }) |m| {
+        try testing.expectEqualStrings("404 Not Found", statusOf(route("/nope", m)).?);
+    }
 }
