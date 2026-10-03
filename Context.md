@@ -250,16 +250,66 @@ The write path was re-checked **for its effect, not just its status**:
 
 ### Two known gaps, deliberately not fixed here
 
-1. **`HEAD` sends a body.** `HEAD /` returns 200 with `Content-Length: 5744`
-   *and* all 5744 bytes; RFC 9110 forbids a body on a HEAD response. HEAD is
-   reachable — it is a real request, not a theoretical one. Splitting GET and
-   HEAD in `respond` is a larger change than fixing the status code, so it is
-   left undone rather than half-done.
+1. **`HEAD` sends a body** — fixed since this was written; see below.
 2. **A malformed request line still answers 200.** `extractMethod` and
    `extractPath` default to `"GET"` and `"/"` when the token is missing, so a
    blank request line, or a bare `GET` with no path, returns the whole
    dashboard with 200. That is a malformed request rather than a missing
    *route*, so it wants a 400.
+
+## HEAD was sending a body, and the writer never knew the method
+
+`respond` sent the body unconditionally and had no knowledge of the request at
+all. The status was decided by the router while the framing was decided by a
+writer that had never seen the method — two places deciding one thing, which is
+precisely the arrangement PR #4 removed from the status code. Measured over a
+socket against a binary built from `main`, HEAD was byte-identical to GET on
+every route:
+
+```
+HEAD /           -> 200 OK  Content-Length=5744   actual body bytes = 5744
+HEAD /style.css  -> 200 OK  Content-Length=12126  actual body bytes = 12126
+HEAD /app.js     -> 200 OK  Content-Length=17926  actual body bytes = 17926
+HEAD /nope       -> 404     Content-Length=10     actual body bytes = 10
+```
+
+Not cosmetic. A client that reads by `Content-Length` consumes 5744 bytes of
+dashboard it never asked for.
+
+`Framing` is computed once in `serveOnce`, from the same `method` the router just
+used, and threaded to `respond`. HEAD is admitted by `accept` exactly where GET
+is and suppressed for exactly the same requests, because both read one variable
+rather than each deciding for itself. After:
+
+```
+HEAD /           -> 200 OK  Content-Length=5744   body bytes = 0
+HEAD /index.html -> 200 OK  Content-Length=5744   body bytes = 0
+HEAD /style.css  -> 200 OK  Content-Length=12126  body bytes = 0
+HEAD /app.js     -> 200 OK  Content-Length=17926  body bytes = 0
+HEAD /nope       -> 404     Content-Length=10     body bytes = 0
+HEAD /app.js.map -> 404     Content-Length=10     body bytes = 0
+```
+
+`Content-Length` is still the length GET would have returned, not zero: RFC 9110
+says a HEAD response's headers SHOULD match what GET would have sent. Zeroing it
+would make the framing consistent by making the header a lie.
+
+### The check that actually matters: what the connection does next
+
+Framing is only correct if the bytes on the wire match the header. Sending a
+second request down the same socket straight after `HEAD /`:
+
+```
+response 1 status       : HTTP/1.1 200 OK
+declared Content-Length : 5744
+body bytes after headers: 0
+second request          : refused at the socket (ConnectionAbortedError)
+```
+
+The server sent `Connection: close` and then closed, so the client is told the
+connection is finished and the socket confirms it. No phantom 5744 bytes arrive
+to be misread as a second response. Before the fix those bytes existed and a
+client trusting `Content-Length` would have consumed them.
 
 ### A gate hole this work hit
 
@@ -276,9 +326,9 @@ dead code behind a green gate.
 ## What comes next
 
 1. **Make `check` build the executable** — the gate currently passes on code
-   that cannot link into a server. Found the hard way on PR #4.
-2. **Return 400 for an unparseable request line**, and send no body for HEAD.
-   Both are known and confirmed reachable from the real surface.
+   that cannot link into a server. Found the hard way on PR #4. (PR #5, open.)
+2. **Return 400 for an unparseable request line.** Known and confirmed reachable
+   from the real surface. (PR #6, open.)
 3. **Multi-segment pool** — the tier resolver sums free space across roots and
    holds `RESERVE_BYTES` per volume (PR #1), but the pool is still a single file
    on a single volume, so nothing is gained on disk yet.
@@ -287,8 +337,13 @@ dead code behind a green gate.
 5. **Run the benchmark in CI.** Every number above is from one run on one
    machine. Nothing re-measures it, so the next edit can quietly make it stale
    the way the hardcoded `0.08` did — as the probe count already did once.
+6. **Reconcile the three open HTTP branches before merging any of them.** PR #5,
+   #6 and this one each edit `serveOnce` and `Context.md` independently. The
+   framing threads through the same call sites PR #6 rewrites, so the union is
+   not purely a `Context.md` merge.
 
-Resolved since this list was first written: the hardcoded `0.08` ratio (PR #3).
+Resolved since this list was first written: the hardcoded `0.08` ratio (PR #3),
+and no body on a HEAD response.
 
 ## Running things
 
