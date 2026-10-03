@@ -1,0 +1,16 @@
+# Zig build output
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Windows build artifacts
+*.o
+*.obj
+*.exe
+*.dll
+*.pdb
+*.ilk
+
+# Runtime state
+engine.log
+.freebuff/

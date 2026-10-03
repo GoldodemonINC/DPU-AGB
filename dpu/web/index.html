@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DPU // Disk-Dependent Processing Unit</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="scanlines" aria-hidden="true"></div>
+
+<header class="frame top-bar">
+  <div class="brand">
+    <span class="led on"></span>
+    <span class="brand-name">DPU</span>
+    <span class="brand-sub">DISK-DEPENDENT PROCESSING UNIT</span>
+  </div>
+  <div class="top-readouts">
+    <div class="readout"><label>POOL</label><span id="ro-pool">P:\</span></div>
+    <div class="readout"><label>MODE</label><span id="ro-mode">xHIGH</span></div>
+    <div class="readout"><label>UPTIME</label><span id="ro-uptime">00:00:00</span></div>
+    <div class="readout"><label>AGENTS</label><span id="ro-agents">0</span></div>
+  </div>
+</header>
+
+<main class="grid">
+
+  <!-- ======================= TOP: LIVE TELEMETRY ======================= -->
+  <section class="frame canvas-panel">
+    <div class="frame-title">
+      <span>LIVE TELEMETRY</span>
+      <span class="frame-title-right" id="sample-rate">250ms &middot; PDH</span>
+    </div>
+
+    <div class="canvas-wrap">
+      <canvas id="scope"></canvas>
+    </div>
+
+    <div class="metrics">
+      <div class="metric">
+        <label>DISK READ</label>
+        <div class="metric-value" id="m-read">0.00</div>
+        <div class="metric-unit">MB/s</div>
+      </div>
+      <div class="metric">
+        <label>DISK WRITE</label>
+        <div class="metric-value" id="m-write">0.00</div>
+        <div class="metric-unit">MB/s</div>
+      </div>
+      <div class="metric">
+        <label>POOL SATURATION</label>
+        <div class="metric-value" id="m-sat">0.0</div>
+        <div class="metric-unit">%</div>
+        <div class="meter"><div class="meter-fill" id="m-sat-bar"></div></div>
+      </div>
+      <div class="metric">
+        <label>GPU SHARED</label>
+        <div class="metric-value" id="m-gpu">0</div>
+        <div class="metric-unit">MB</div>
+      </div>
+      <div class="metric">
+        <label>PAGE FAULTS</label>
+        <div class="metric-value" id="m-pf">0</div>
+        <div class="metric-unit">/sec</div>
+      </div>
+      <div class="metric">
+        <label>MEM FREE</label>
+        <div class="metric-value" id="m-mem">0.00</div>
+        <div class="metric-unit">GB</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== LEFT: BEING USED BY ========================= -->
+  <section class="frame node-panel">
+    <div class="frame-title">
+      <span>BEING USED BY</span>
+      <span class="frame-title-right" id="node-total">0 NODES</span>
+    </div>
+
+    <div class="node-head">
+      <span class="col-node">NODE</span>
+      <span class="col-role">ROLE</span>
+      <span class="col-num">RESIDENT</span>
+      <span class="col-num">FAULTS</span>
+      <span class="col-num">CPU</span>
+    </div>
+
+    <div class="node-list" id="node-list"></div>
+
+    <div class="node-summary">
+      <div class="summary-row">
+        <span class="swatch agent"></span><span>AGENT</span>
+        <b id="sum-agent">0</b>
+      </div>
+      <div class="summary-row">
+        <span class="swatch gfx"></span><span>GRAPHICS</span>
+        <b id="sum-gfx">0</b>
+      </div>
+      <div class="summary-row">
+        <span class="swatch sys"></span><span>SYSTEM</span>
+        <b id="sum-sys">0</b>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== RIGHT: CONTROL MATRIX ======================= -->
+  <section class="frame control-panel">
+    <div class="frame-title"><span>CONTROL MATRIX</span></div>
+
+    <div class="ctl-group">
+      <label class="ctl-label">POWER MODE</label>
+      <div class="ctl-buttons" id="power-group">
+        <button class="ctl-btn" data-power="max">
+          <span class="ctl-name">MAX</span>
+          <span class="ctl-desc">aggressive prefetch</span>
+        </button>
+        <button class="ctl-btn" data-power="xhigh">
+          <span class="ctl-name">xHIGH</span>
+          <span class="ctl-desc">balanced</span>
+        </button>
+        <button class="ctl-btn" data-power="low">
+          <span class="ctl-name">LOW</span>
+          <span class="ctl-desc">minimal IO</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="ctl-group">
+      <label class="ctl-label">PREFETCH DEPTH</label>
+      <div class="prefetch-value" id="prefetch-value">4</div>
+    </div>
+
+    <div class="ctl-group">
+      <label class="ctl-label">MULTI-AGENT SPLIT</label>
+      <button class="toggle" id="split-toggle" aria-pressed="true">
+        <span class="toggle-track"><span class="toggle-knob"></span></span>
+        <span class="toggle-text" id="split-text">ON</span>
+      </button>
+      <div class="ctl-note">Partition VRAM buffer across active agent contexts</div>
+    </div>
+
+    <div class="ctl-group">
+      <label class="ctl-label">VRAM BUFFER</label>
+      <div class="pool-path" id="pool-path">P:\DPU\pool.vram</div>
+      <div class="sysline"><span>CEILING</span><b id="buf-ceiling">--</b></div>
+      <div class="sysline"><span>USED</span><b id="buf-used">--</b></div>
+      <div class="sysline"><span>ON DISK</span><b id="buf-alloc">--</b></div>
+      <div class="sysline"><span>LATENCY</span><b id="buf-latency">--</b></div>
+      <div class="sysline"><span>SPARSE</span><b id="buf-sparse">--</b></div>
+      <div class="ctl-note" id="pool-note">--</div>
+    </div>
+
+    <div class="ctl-group grow">
+      <label class="ctl-label">SYSTEM</label>
+      <div class="sysline"><span>CPU CORES</span><b>4</b></div>
+      <div class="sysline"><span>PHYSICAL RAM</span><b>7.8 GB</b></div>
+      <div class="sysline"><span>ADAPTERS</span><b>Intel UHD</b></div>
+      <div class="sysline"><span>HVCI</span><b class="warn">ACTIVE</b></div>
+    </div>
+  </section>
+</main>
+
+<!-- ========================= BOTTOM: TICKER ============================ -->
+<footer class="frame ticker-bar">
+  <span class="ticker-tag">STATUS</span>
+  <div class="ticker-window">
+    <div class="ticker-track" id="ticker"></div>
+  </div>
+  <span class="ticker-clock" id="clock">--:--:--</span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

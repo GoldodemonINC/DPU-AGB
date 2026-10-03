@@ -1,0 +1,29 @@
+; Import library for the Vulkan loader.
+;
+; There is no Vulkan SDK on this machine, so vulkan-1.lib does not exist and
+; `zig build -lvulkan-1` cannot resolve it. The loader DLL itself is present in
+; System32 (vulkaninfo works), so the import library is generated from a
+; definition file that names the loader and the four entry points this project
+; calls directly.
+;
+; Generated once with:
+;   zig dlltool -d vulkan-1.def -l vulkan-1.lib -D vulkan-1.dll
+;
+; Only the commands the probe uses are listed. Everything else is reached
+; through vkGetInstanceProcAddr / vkGetDeviceProcAddr at runtime, which is how a
+; real Vulkan application does it anyway.
+;
+; vkGetDeviceProcAddr is here for a specific reason. This loader returns NULL for
+; `vkGetInstanceProcAddr(NULL, "vkGetDeviceProcAddr")`, which the spec requires
+; it to return, so a probe that discovers the device resolver dynamically never
+; gets one. Linking it directly sidesteps that and matches how an application
+; that links vulkan-1 behaves.
+
+LIBRARY vulkan-1
+EXPORTS
+    vkEnumerateInstanceVersion
+    vkEnumerateInstanceExtensionProperties
+    vkEnumerateInstanceLayerProperties
+    vkCreateInstance
+    vkGetInstanceProcAddr
+    vkGetDeviceProcAddr
