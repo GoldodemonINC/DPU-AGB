@@ -263,32 +263,72 @@ The write path was re-checked **for its effect, not just its status**:
 
 ### A gate hole this work hit
 
-`zig build check` does **not** build the server binary — the step never compiles
-`main.zig`. A `switch` in `server.zig` that the test root does not reach passed
+`zig build check` did **not** build the server binary — the step never compiled
+`main.zig`. A `switch` in `server.zig` that the test root did not reach passed
 `check` at 88/88 and then failed `zig build` with `expected optional type, found
-'[]const u8'`. Making `check_step` depend on the install step would close it.
+'[]const u8'`.
+
 The same reasoning applies to test discovery: `zig build test` only finds tests
 in the root module and its relative imports, so `server.zig`'s tests needed
 `backend_test.zig` to pull the file in and `build.zig` to give the test root the
 same `web_assets` import the exe has. Without both, ten tests would have been
 dead code behind a green gate.
 
+## The gate now builds the server executable
+
+`check_step.dependOn(b.getInstallStep())` is the whole fix. The hole was measured,
+not assumed:
+
+With one well-formatted line added to `src/main.zig` — a call to
+`thisFunctionDoesNotExist()`, which compiles as formatting and fails as code:
+
+```
+BEFORE   zig build check -> Build Summary: 10/10 steps succeeded; 88/88 tests passed
+                           check success                        exit 0
+         zig build       -> src\main.zig:45:9: error: use of undeclared identifier
+                            'thisFunctionDoesNotExist'          exit 1
+
+AFTER    zig build check -> +- install transitive failure
+                             +- install dpu transitive failure
+                                +- compile exe dpu Debug native 1 errors
+                            src\main.zig:45:9: error: use of undeclared identifier
+                              'thisFunctionDoesNotExist'        exit 1
+```
+
+The same injection, same command, one line of `build.zig` between them.
+
+Note what the first case actually proved, because it is subtler than it looks.
+PR #4 wired `server.zig` into the test module, so a syntax error *there* does
+now fail the gate — the first attempt at reproducing this passed for the wrong
+reason. `main.zig` is the root of no test module at all, which is why an error in
+it stayed invisible. The general lesson: adding a file to a test root is not the
+same as building it, and a gate that only compiles what the tests happen to
+import cannot be relied on for the shipping binary.
+
+`zig build check` now also leaves `zig-out/bin/dpu.exe` behind, verified from a
+deleted `zig-out`. That is a side effect worth naming: the gate is no longer a
+pure verification step, it now writes build output.
+
 ## What comes next
 
-1. **Make `check` build the executable** — the gate currently passes on code
-   that cannot link into a server. Found the hard way on PR #4.
-2. **Return 400 for an unparseable request line**, and send no body for HEAD.
+1. **Return 400 for an unparseable request line**, and send no body for HEAD.
    Both are known and confirmed reachable from the real surface.
-3. **Multi-segment pool** — the tier resolver sums free space across roots and
+2. **Multi-segment pool** — the tier resolver sums free space across roots and
    holds `RESERVE_BYTES` per volume (PR #1), but the pool is still a single file
    on a single volume, so nothing is gained on disk yet.
-4. **Process-level pool locking test** — existing tests prove a *thread* releases
+3. **Process-level pool locking test** — existing tests prove a *thread* releases
    `Local\DPU.pool.lock`; none proves two *processes* cannot corrupt `pool.vram`.
-5. **Run the benchmark in CI.** Every number above is from one run on one
+4. **Run the benchmark in CI.** Every number above is from one run on one
    machine. Nothing re-measures it, so the next edit can quietly make it stale
    the way the hardcoded `0.08` did — as the probe count already did once.
+5. **Decide whether `check` should keep writing `zig-out`.** Making the gate
+   build the executable was necessary, but it also made a verification step
+   produce artifacts. If that is unwanted, the alternative is a compile-only
+   step (`addObject`/`addExecutable` without `installArtifact`) that proves the
+   build graph resolves without writing anything.
 
-Resolved since this list was first written: the hardcoded `0.08` ratio (PR #3).
+Resolved since this list was first written: the hardcoded `0.08` ratio (PR #3),
+and `check` building the server executable.
 
 ## Running things
 
