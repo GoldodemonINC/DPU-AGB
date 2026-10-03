@@ -48,7 +48,7 @@ pub fn main() !void {
 
     // Measured before the sweep, not after: an 8 GiB write storm leaves the
     // system busy enough to halve a naive memcpy reading.
-    const ram_mbps = measureRam(gpa);
+    const ram = measureRam(gpa);
     var device_random_us: f64 = 0;
 
     var dev = try blockdev.BlockDevice.init(gpa, "P:\\", "P:\\DPU", blockdev.DEFAULT_CEILING);
@@ -98,19 +98,31 @@ pub fn main() !void {
     std.debug.print("    uncached write: {d:.1} us best-case\n", .{best_w});
 
     // ------------------------------------------------------------- reference
+    //
+    // Every figure below is measured in this run, on this machine, and the
+    // ratio is computed from the two measured halves rather than from a quoted
+    // constant. An earlier revision printed `67.3 / 0.08` here: `device_random_us`
+    // beside it was real, `0.08` was a hardcoded literal that nothing measured,
+    // and the printed multiplier was the invention divided by the invention's
+    // partner. README quoted the same 840x for months.
+    const ratio = if (ram.random_us > 0) device_random_us / ram.random_us else 0;
     std.debug.print(
         \\
-        \\  reference: system RAM memcpy {d:.0} MB/s (measured before the sweep),
-        \\             random access ~80 ns
+        \\  reference -- every figure below was measured in this run:
         \\
-        \\  => at an 8 GiB working set the pool runs about {d:.0}x slower than
-        \\     RAM on random access ({d:.0} us vs 0.08 us). That gap, not the
+        \\    system RAM memcpy         {d:>8.0} MB/s   (256 MiB, sequential)
+        \\    system RAM random access  {d:>8.3} us     (dependent loads, 256 MiB set)
+        \\    pool random access        {d:>8.1} us     (uncached 4 KiB reads, 8 GiB set)
+        \\
+        \\  => the pool runs about {d:.0}x slower than RAM on random access,
+        \\     dividing the two measured numbers above. That gap, not the
         \\     bandwidth, is what every layer above has to design around.
         \\
     , .{
-        ram_mbps,
-        67.3 / 0.08,
+        ram.mbps,
+        ram.random_us,
         device_random_us,
+        ratio,
     });
 
     const info = dev.sparseInfo();
@@ -212,18 +224,48 @@ const Random = struct {
     }
 };
 
-fn measureRam(gpa: std.mem.Allocator) f64 {
+/// Both RAM-side figures the reference banner needs, measured here rather than
+/// quoted.
+///
+/// `random_us` is the honest counterpart to the pool's uncached 4 KiB random
+/// read: a dependent pointer chase through a 256 MiB buffer, so every step
+/// misses cache and the prefetcher has nothing to work with. The previous
+/// version of this banner divided the *measured* device latency by a hardcoded
+/// `0.08` that nothing in this project ever measured, which put a real number
+/// next to an invented one and divided by the invention.
+const RamSample = struct {
+    mbps: f64,
+    random_us: f64,
+};
+
+fn measureRam(gpa: std.mem.Allocator) RamSample {
+    const none = RamSample{ .mbps = 0, .random_us = 0 };
     const size: usize = 256 * 1024 * 1024;
-    const a = gpa.alignedAlloc(u8, .@"16", size) catch return 0;
+    const a = gpa.alignedAlloc(u64, .@"16", size / @sizeOf(u64)) catch return none;
     defer gpa.free(a);
-    const b = gpa.alignedAlloc(u8, .@"16", size) catch return 0;
+    const b = gpa.alignedAlloc(u8, .@"16", size) catch return none;
     defer gpa.free(b);
-    @memset(a, 1);
+    @memset(a, @as(u64, 1));
     const t = tickUs();
-    @memcpy(b, a);
+    @memcpy(b, std.mem.sliceAsBytes(a));
     const us = usSince(t);
-    if (us <= 0) return 0;
-    return @as(f64, @floatFromInt(size)) / (us / 1_000_000.0) / MB;
+    const mbps = if (us <= 0) 0 else @as(f64, @floatFromInt(size)) / (us / 1_000_000.0) / MB;
+
+    // A stride that is coprime with the element count and long enough that the
+    // hardware prefetcher cannot learn it. Each step depends on the previous
+    // one, so the loads cannot be issued in parallel either.
+    const n = a.len;
+    for (a, 0..) |*slot, i| slot.* = @intCast((i + 1) *% 2_654_435_761 % n);
+
+    var idx: usize = 0;
+    for (0..200_000) |_| idx = @intCast(a[idx]); // warm the path
+    const reps: usize = 20_000_000;
+    const t2 = tickUs();
+    for (0..reps) |_| idx = @intCast(a[idx]);
+    const per_us = usSince(t2) / @as(f64, @floatFromInt(reps));
+    std.mem.doNotOptimizeAway(idx);
+
+    return .{ .mbps = mbps, .random_us = per_us };
 }
 
 fn tickUs() u64 {

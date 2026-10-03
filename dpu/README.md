@@ -174,7 +174,14 @@ So the honest summary:
   RAID controller. Under ~2 GiB working set you are measuring the controller
   cache (3–6 µs random, ~4 GB/s read). At 8 GiB the device numbers are
   ~295–385 MB/s write, ~377–487 MB/s read, ~62–66 µs random 4 KiB read — roughly
-  840× worse than RAM. Quote the 8 GiB figures; the small ones are noise.
+  4000× worse than RAM -- and that ratio is now measured on both
+  sides rather than quoted. The benchmark chases dependent pointers through
+  a 256 MiB buffer for the RAM half (0.587 us/access on this machine) and
+  times uncached 4 KiB reads at an 8 GiB working set for the pool half
+  (2370 us), then divides the two. It used to print `67.3 / 0.08`, dividing
+  a measured device figure by a hardcoded 0.08 us that nothing in this
+  project ever measured, and this sentence repeated the resulting number
+  as fact. Quote the 8 GiB figures; the small ones are noise.
 
 ## Layout
 
