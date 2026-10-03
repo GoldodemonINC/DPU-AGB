@@ -5,7 +5,7 @@ applications as a discrete GPU through a user-mode installable client driver.
 
 ## Status at this commit
 
-`zig build check` — **99/99 tests**, exit 0, `zig fmt --check` clean. The gate
+`zig build check` — **108/108 tests**, exit 0, `zig fmt --check` clean. The gate
 also builds `dpu.exe`, so a green run now means the shipping binary compiles.
 
 `zig build probe` — **50/50, exit 0**, closing with
@@ -30,11 +30,16 @@ is worse than no number.
 | `2225369` | #4 | Let the router pick the status, so a miss cannot answer 200 |
 | `caa8ab6` | — | Correct the merge-history table in Context.md |
 
-This branch is the union of three still-open PRs, none of which is merged:
+This branch is stacked on **#8**, which is itself the union of three still-open
+PRs, none of which is merged:
 
 - **#5** `fix/check-must-build-the-exe` — the gate now builds the executable.
 - **#6** `fix/malformed-request-400` — 400 for a request line that is not one.
 - **#7** `fix/head-response-no-body` — no body on a HEAD response.
+
+On top of that, this branch adds the wire-level suite described below. It cannot
+be merged before #8, and it exists only because #5, #6 and #7 are all claims
+about HTTP behaviour that nothing in the repository was checking.
 
 PR #1 merged at 2026-10-03T18:06:35Z by the `Goldodemon-Automation` credential
 while a task was mid-run on another branch; PR #2 was merged immediately when
@@ -119,6 +124,78 @@ the status line but the connection: a second request sent down the same socket
 after `HEAD /` is refused (`ConnectionAbortedError`) because the server sent
 `Connection: close` and closed. No phantom 5744 bytes arrive to be misread as a
 second response.
+
+## The HTTP surface is asserted on the wire, not just in the router
+
+`src/server_wire_test.zig` — nine tests that drive the real `Server` over
+loopback TCP and read the responses off a socket. They are part of the existing
+`zig build test` root, so `zig build check` runs them; there is no separate step
+to forget.
+
+They exist because of a specific, measured gap. The twenty-one tests in
+`server.zig` call `route`, `routeRequest` and `framingFor` directly. None of them
+opens a socket, formats a status line, or compares a `Content-Length` against
+the bytes that actually followed it. So the assertion "a miss is 404" was, in
+practice, the assertion "the router returns a Route whose status string says
+404" — and the 200-for-a-miss bug shipped through all of them green, because
+`respond404` built the correct body and then handed it to `respond200`, which
+hardcoded the status line. Everything above the socket was correct and the
+client still got `200 OK`.
+
+What the suite asserts, and why each one is not a restatement of the code:
+
+| Test | Claim |
+|---|---|
+| every route in the matrix answers the status it claims | all 16 rows of the external matrix, on the wire, each with `Content-Length` equal to the bytes that followed and no `Allow` on a 404 |
+| the dashboard body on the wire is the dashboard | `/` really is the HTML document, and `/` and `/index.html` are byte-identical — so the lengths above belong to the right content |
+| a request line that is not one is 400, and carries no dashboard | the six malformed shapes answer 400 with exactly `bad request\n` and no `<!DOCTYPE` anywhere in the body |
+| a malformed line is 400 even when its target names no route | the malformed check runs before any route lookup: four shapes naming `/nope` answer the same 400 as the shapes that named nothing, so a client cannot use a malformed request to discover whether a path exists |
+| valid request lines that look unusual still route | #6 did not over-reach: a line with no trailing CRLF, and one with a leading space, still serve |
+| a control write is visible in the telemetry that follows it | POST `power=low`, then GET telemetry and find `"power":"LOW"` and `"prefetch":1` — the dashboard's own exchange, as a gate check rather than a demo |
+| HEAD advertises the length GET returns, and sends no bytes | same status, `Content-Length` equal to the length GET *actually returned*, body zero — on three assets, the second spelling of the dashboard, and two misses |
+| only HEAD suppresses the body | the negative case: every other verb still gets its body, so the HEAD result is not an artefact of everything being empty |
+| a HEAD connection carries no phantom body and is closed after it | reads the header block only, then requires **zero** further bytes, then requires a second request on that socket to get no response |
+
+The last one is the one no other test can be. A framing regression is invisible
+in the response: `respond` can advertise the right `Content-Length` and still
+write the body, and the bytes only become visible to whoever reads the socket
+next. The unit tests call `framingFor` and see a correct enum; only a socket can
+see that 5744 bytes arrived anyway.
+
+### It costs one server, not nine
+
+`serveOnce` blocks in `accept` until a client arrives, so driving it needs a
+client on the other end. Binding a server per test would mean a `WSAStartup`, a
+bind, a listen and a teardown per case — the slow way to learn nothing. Instead
+the harness holds one server bound to port 0 (so it can never collide with a
+running engine on 8787) and one `Context` for the life of the test binary, and
+each exchange is: connect, write, call `serveOnce`, read to EOF. `serveOnce`
+runs on the test's own thread, so there is no server thread, no shutdown race
+and no accept timeout — the ordering is the caller's.
+
+Measured cost: **140 ms**, as the difference between the minimum of twelve
+alternating runs of the 61-test binary and the 52-test one without it. The
+suite's own time is dominated by the block-device integration tests.
+
+One trap worth naming, because it hung the first version of this file:
+`serveOnce` takes no socket — it serves whichever connection is next in the
+accept backlog. A test that opens a connection and then lets something else
+serve blocks forever in the server's `recv`. The harness tracks whether a
+connection is queued and aborts loudly instead, so the mistake is a failed test
+rather than a hung gate.
+
+### It has been shown to fail
+
+A regression is only worth a test if the test can go red. Two were injected and
+reverted:
+
+| Regression injected | Result |
+|---|---|
+| `respond` always writes the body, ignoring `framing` | `CHECK_EXIT=1` — `HEAD advertises the length GET returns` failed with `expected 0, found 5744`, and the phantom-body test failed with it. **All 21 unit tests still passed.** |
+| a miss answers `200 OK` instead of `404 Not Found` | `CHECK_EXIT=1` — the wire matrix failed, alongside five unit tests that already covered the same claim |
+
+The first is the point of the file. That regression is invisible to every test
+above the socket, and it is exactly the defect #7 exists to remove.
 
 ## The loader/ICD handle contract, as measured
 
@@ -209,8 +286,8 @@ a handler that forgets to thread it.
 
 ## What comes next
 
-1. **Retire #5, #6 and #7.** They are fully contained in this branch. Closing
-   them is the user's call, not the agent's.
+1. **Retire #5, #6 and #7.** They are fully contained in #8. Closing them is the
+   user's call, not the agent's.
 2. **Multi-segment pool** — the tier resolver sums free space across roots and
    holds `RESERVE_BYTES` per volume (PR #1), but the pool is still a single file
    on a single volume, so nothing is gained on disk yet.
@@ -223,6 +300,11 @@ a handler that forgets to thread it.
 5. **Run the benchmark in CI.** Every number above is from one run on one machine.
    Nothing re-measures it, so the next edit can quietly make it stale the way the
    hardcoded `0.08` did — as the probe count already did once.
+6. **Extend the wire suite where the claims are still unchecked.** It covers
+   every route the dashboard can reach, and nothing else: there is no route yet
+   that takes a body, no keep-alive, and no concurrent client. Each of those is
+   a claim someone will eventually make, and the suite should already be red when
+   they start.
 
 ## Running things
 
