@@ -122,8 +122,14 @@ pub const Pool = struct {
     /// "you asked for 24 and got 24" and "you asked for 24 and the disk only
     /// had room for 16" — a distinction the dashboard needs, because the second
     /// one is a capacity problem the user can actually act on.
+    ///
+    /// The resolver takes a list of roots because it accounts the reserve per
+    /// volume. The pool is still one file on one volume, so that list has one
+    /// entry today and the arithmetic is unchanged — but the signature no
+    /// longer forces every caller to pretend the second root does not exist.
     pub fn applyTier(self: *Pool, mode: tiers.Mode) tiers.Resolution {
-        const res = tiers.resolve(mode, self.freeSpace());
+        const roots = [_]u64{self.freeSpace()};
+        const res = tiers.resolve(mode, &roots);
         if (res.granted > 0) _ = self.dev.raiseCeiling(res.granted);
         self.publishTier(res);
         return res;

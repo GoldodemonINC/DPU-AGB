@@ -237,7 +237,13 @@ pub const Server = struct {
             // Resolved per request rather than cached, so a power-mode change
             // shows up on the next tick even though the pool's own ceiling is
             // monotonic and will not move until the tier is applied.
-            const res = tiers.resolve(ctx.engine.power.tier(), p.freeSpace());
+            //
+            // A one-element root list: the pool is still one file on one
+            // volume. The resolver takes a list because it holds back the
+            // reserve per volume, so widening this to the nested volume is a
+            // change here rather than a change to every caller.
+            const roots = [_]u64{p.freeSpace()};
+            const res = tiers.resolve(ctx.engine.power.tier(), &roots);
             w.print(
                 ",\"buffer\":{{\"ceiling\":{d},\"length\":{d},\"used\":{d},\"allocated\":{d},\"saturation\":{d:.3}," ++
                     "\"readBps\":{d:.0},\"writeBps\":{d:.0},\"latencyMs\":{d:.3}," ++

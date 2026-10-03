@@ -77,23 +77,44 @@ pub const Resolution = struct {
     granted: u64,
     /// True when free space cut the request below the mode's preference.
     clamped: bool,
-    /// True when the volume is too full for even the mode's lowest tier.
+    /// True when no volume has room for even the mode's lowest tier.
     starved: bool,
-    /// Free space the grant was computed against, for the dashboard.
+    /// Free space the grant was computed against, summed over every root, for
+    /// the dashboard. This is the number that was actually available, not a
+    /// single volume's share of it.
     free_at_check: u64,
+    /// How many volumes the grant was computed across. The reserve is taken
+    /// once per volume, so this is the multiplier that explains why two roomy
+    /// volumes are not quite as roomy as their sum.
+    roots: u32,
 };
 
 /// Pick the largest tier that fits both the mode's ceiling and the space
 /// actually free once the reserve is taken off the top.
+///
+/// `roots` is the free space of each volume the pool may live on, in bytes.
+/// The budget is their sum less `RESERVE_BYTES` *per volume*, not per pool:
+/// filling a disk is the one outcome that cannot be recovered from, and that
+/// promise has to hold for every volume involved, not just the first one the
+/// pool happens to land on. Two volumes that each sit 3 GiB above their own
+/// reserve together offer 2 GiB, not 4 -- spending the second volume's
+/// headroom would leave the OS no room on it.
 ///
 /// The mode is an upper bound, not a floor. An earlier version searched only
 /// the mode's own band, which meant MAX on a 7 GiB volume granted nothing at
 /// all while 4 GiB sat available — the mode was supposed to be asking for
 /// more room, not vetoing the pool's existence. Degrading below the band is
 /// the difference between "asking for 24" and "having no device".
-pub fn resolve(mode: Mode, free_bytes: u64) Resolution {
+pub fn resolve(mode: Mode, roots: []const u64) Resolution {
     const requested = mode.maxTier();
-    const budget = if (free_bytes > RESERVE_BYTES) free_bytes - RESERVE_BYTES else 0;
+
+    // Saturating: a bogus free-space figure must clamp to a smaller pool, not
+    // wrap into a huge budget that the ladder would happily grant.
+    var total: u64 = 0;
+    for (roots) |r| total +|= r;
+    const reserve = RESERVE_BYTES *| @as(u64, @intCast(roots.len));
+    const budget = if (total > reserve) total - reserve else 0;
+
     const cap = @min(requested, budget);
     const granted = tierAtOrBelow(cap);
 
@@ -102,7 +123,8 @@ pub fn resolve(mode: Mode, free_bytes: u64) Resolution {
         .granted = granted,
         .clamped = granted != requested,
         .starved = granted == 0,
-        .free_at_check = free_bytes,
+        .free_at_check = total,
+        .roots = @intCast(roots.len),
     };
 }
 
@@ -192,11 +214,11 @@ test "modes map to the tiers the dashboard advertises" {
 
 test "a roomy volume grants each mode its top tier unclamped" {
     const plenty = 64 * GiB;
-    try testing.expectEqual(@as(u64, 4 * GiB), resolve(.low, plenty).granted);
-    try testing.expectEqual(@as(u64, 8 * GiB), resolve(.x_high, plenty).granted);
-    try testing.expectEqual(@as(u64, 24 * GiB), resolve(.max, plenty).granted);
+    try testing.expectEqual(@as(u64, 4 * GiB), resolve(.low, &[_]u64{plenty}).granted);
+    try testing.expectEqual(@as(u64, 8 * GiB), resolve(.x_high, &[_]u64{plenty}).granted);
+    try testing.expectEqual(@as(u64, 24 * GiB), resolve(.max, &[_]u64{plenty}).granted);
     for ([_]Mode{ .low, .x_high, .max }) |m| {
-        const r = resolve(m, plenty);
+        const r = resolve(m, &[_]u64{plenty});
         try testing.expect(!r.clamped);
         try testing.expect(!r.starved);
     }
@@ -211,7 +233,7 @@ test "a full volume degrades to a lower tier instead of failing" {
     const expect_grant = tierAtOrBelow(budget);
 
     for ([_]Mode{ .low, .x_high, .max }) |m| {
-        const r = resolve(m, seven);
+        const r = resolve(m, &[_]u64{seven});
         try testing.expectEqual(expect_grant, r.granted);
         try testing.expect(r.granted > 0); // never a blackout
         try testing.expect(r.granted <= budget);
@@ -220,16 +242,16 @@ test "a full volume degrades to a lower tier instead of failing" {
         // rather than simply mean "free space was low".
         try testing.expectEqual(r.granted != r.requested, r.clamped);
     }
-    try testing.expect(!resolve(.low, seven).clamped);
-    try testing.expect(resolve(.x_high, seven).clamped);
-    try testing.expect(resolve(.max, seven).clamped);
+    try testing.expect(!resolve(.low, &[_]u64{seven}).clamped);
+    try testing.expect(resolve(.x_high, &[_]u64{seven}).clamped);
+    try testing.expect(resolve(.max, &[_]u64{seven}).clamped);
 }
 
 test "a mode never exceeds its own ceiling even on a huge volume" {
     const huge = 512 * GiB;
-    try testing.expect(resolve(.low, huge).granted <= Mode.low.maxTier());
-    try testing.expect(resolve(.x_high, huge).granted <= Mode.x_high.maxTier());
-    try testing.expectEqual(Mode.max.maxTier(), resolve(.max, huge).granted);
+    try testing.expect(resolve(.low, &[_]u64{huge}).granted <= Mode.low.maxTier());
+    try testing.expect(resolve(.x_high, &[_]u64{huge}).granted <= Mode.x_high.maxTier());
+    try testing.expectEqual(Mode.max.maxTier(), resolve(.max, &[_]u64{huge}).granted);
 }
 
 test "24 GiB is refused on this volume because it does not fit" {
@@ -237,7 +259,7 @@ test "24 GiB is refused on this volume because it does not fit" {
     // leave the OS under 1.3 GiB on the same physical disk, so the ladder's
     // top rung is only ever granted somewhere with room to spare.
     const actual = 25.17 * @as(f64, GiB);
-    const r = resolve(.max, @intFromFloat(actual));
+    const r = resolve(.max, &[_]u64{@intFromFloat(actual)});
     try testing.expect(r.clamped);
     try testing.expect(r.granted < 24 * GiB);
     try testing.expectEqual(@as(u64, 16 * GiB), r.granted);
@@ -245,7 +267,7 @@ test "24 GiB is refused on this volume because it does not fit" {
 
 test "a starved volume reports starvation rather than a silent zero" {
     for ([_]Mode{ .low, .x_high, .max }) |m| {
-        const r = resolve(m, RESERVE_BYTES / 2);
+        const r = resolve(m, &[_]u64{RESERVE_BYTES / 2});
         try testing.expect(r.starved);
         try testing.expectEqual(@as(u64, 0), r.granted);
         // The request is still reported, so the UI can say why.
@@ -255,9 +277,98 @@ test "a starved volume reports starvation rather than a silent zero" {
 
 test "granted never exceeds requested even on an enormous volume" {
     for ([_]Mode{ .low, .x_high, .max }) |m| {
-        const r = resolve(m, 1024 * GiB);
+        const r = resolve(m, &[_]u64{1024 * GiB});
         try testing.expect(r.granted <= r.requested);
     }
+}
+
+// ------------------------------------------------------------- multiple roots
+
+test "two volumes grant MAX where either alone would clamp it" {
+    // The case this change exists for. P:\ alone is 25.17 GiB, which refuses
+    // the 24 GiB rung and settles for 16. Adding the nested volume's 13.79
+    // GiB clears 24 GiB plus both reserves, so the top of the ladder becomes
+    // reachable for the first time on this machine.
+    const p_root: u64 = @intFromFloat(25.17 * @as(f64, GiB));
+    const d_root: u64 = @intFromFloat(13.79 * @as(f64, GiB));
+    const both = [_]u64{ p_root, d_root };
+
+    const one_root = resolve(.max, &[_]u64{p_root});
+    const two_roots = resolve(.max, &both);
+
+    try testing.expect(one_root.clamped);
+    try testing.expectEqual(@as(u64, 16 * GiB), one_root.granted);
+
+    try testing.expect(!two_roots.clamped);
+    try testing.expectEqual(@as(u64, 24 * GiB), two_roots.granted);
+    try testing.expectEqual(@as(u32, 2), two_roots.roots);
+}
+
+test "the reserve is taken once per volume, not once per pool" {
+    // Each volume sits 3 GiB above its own 2 GiB reserve, so 5 GiB free apiece
+    // and 10 GiB gross. The budget is 10 - (2 x 2) = 6 GiB, which lands
+    // exactly on a rung. Taking a single reserve instead would offer 8 GiB and
+    // leave each disk with 1 GiB for the OS, which is the outcome the reserve
+    // exists to prevent.
+    const each = RESERVE_BYTES + 3 * GiB;
+    const roots = [_]u64{ each, each };
+    const r = resolve(.max, &roots);
+
+    try testing.expectEqual(@as(u64, 10 * GiB), r.free_at_check);
+    try testing.expectEqual(@as(u64, 6 * GiB), r.granted);
+    try testing.expect(r.clamped);
+    try testing.expect(!r.starved);
+}
+
+test "per-volume reserve and single-reserve accounting give different grants" {
+    // The test that would actually fail if the reserve were taken once for the
+    // pool. Two volumes of 3 GiB: summing and subtracting one reserve gives
+    // 6 - 2 = 4 GiB and a 4 GiB pool, which would consume both disks down to
+    // 1 GiB each. Per volume it is 6 - 4 = 2 GiB and a 2 GiB pool.
+    const roots = [_]u64{ 3 * GiB, 3 * GiB };
+    const per_volume = resolve(.max, &roots);
+    const single_reserve = tierAtOrBelow(6 * GiB - RESERVE_BYTES);
+
+    try testing.expectEqual(@as(u64, 2 * GiB), per_volume.granted);
+    try testing.expectEqual(@as(u64, 4 * GiB), single_reserve);
+    try testing.expect(per_volume.granted != single_reserve);
+}
+
+test "two volumes that each have the reserve and nothing more are starved" {
+    // The per-volume reserve is the whole point: a volume that is exactly at
+    // its reserve contributes nothing, however many of them there are.
+    const at_reserve = [_]u64{ RESERVE_BYTES, RESERVE_BYTES };
+    try testing.expect(resolve(.low, &at_reserve).starved);
+    try testing.expectEqual(@as(u64, 0), resolve(.low, &at_reserve).granted);
+}
+
+test "one volume resolving through the multi-root path is unchanged" {
+    // The single-volume case is not a special case that could drift; it is
+    // the same arithmetic with a one-element slice, and this pins that.
+    const free = 25.17 * @as(f64, GiB);
+    const bytes: u64 = @intFromFloat(free);
+    const r = resolve(.max, &[_]u64{bytes});
+    try testing.expectEqual(@as(u64, 16 * GiB), r.granted);
+    try testing.expectEqual(@as(u32, 1), r.roots);
+    try testing.expectEqual(bytes, r.free_at_check);
+}
+
+test "no volumes grants nothing rather than an unlimited pool" {
+    const none = resolve(.max, &[_]u64{});
+    try testing.expectEqual(@as(u64, 0), none.granted);
+    try testing.expect(none.starved);
+    try testing.expectEqual(@as(u32, 0), none.roots);
+    try testing.expectEqual(@as(u64, 0), none.free_at_check);
+}
+
+test "an absurd free-space figure cannot overflow into a larger budget" {
+    // Saturating add: two volumes each reporting u64 max must not wrap into a
+    // budget smaller than one of them, which would silently clamp MAX.
+    const huge = [_]u64{ std.math.maxInt(u64), std.math.maxInt(u64) };
+    const r = resolve(.max, &huge);
+    try testing.expectEqual(std.math.maxInt(u64), r.free_at_check);
+    try testing.expectEqual(Mode.max.maxTier(), r.granted);
+    try testing.expect(!r.clamped);
 }
 
 test "tier state round-trips through the file format" {
