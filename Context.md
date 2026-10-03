@@ -255,11 +255,64 @@ The write path was re-checked **for its effect, not just its status**:
    reachable — it is a real request, not a theoretical one. Splitting GET and
    HEAD in `respond` is a larger change than fixing the status code, so it is
    left undone rather than half-done.
-2. **A malformed request line still answers 200.** `extractMethod` and
-   `extractPath` default to `"GET"` and `"/"` when the token is missing, so a
-   blank request line, or a bare `GET` with no path, returns the whole
-   dashboard with 200. That is a malformed request rather than a missing
-   *route*, so it wants a 400.
+2. **A malformed request line answers 200** — fixed since this was written; see
+   below. Kept here as the record of what it was.
+
+## A malformed request line was answered 200 with the whole dashboard
+
+`extractMethod` and `extractPath` were two functions that each supplied a default:
+the method defaulted to `"GET"` and the path to `"/"`. A default is a guess, and a
+guess about a request line is a guess about what the client asked for.
+
+Measured over a socket against a binary built from `main`:
+
+```
+A blank request line          -> 200 OK   body[5744] <!DOCTYPE html>...
+B bare GET, no path           -> 200 OK   body[5744] <!DOCTYPE html>...
+C method + space, no path     -> 200 OK   body[5744] <!DOCTYPE html>...
+D spaces only                 -> 200 OK   body[5744] <!DOCTYPE html>...
+F single LF                   -> 200 OK   body[5744] <!DOCTYPE html>...
+E tab-separated request line  -> 405 Method Not Allowed, Allow: GET, HEAD
+```
+
+The hole was wider than the blank line that was reported. Five shapes resolved to
+`GET /` and served the index page with a 200, and a sixth produced something
+different and equally wrong: a tab-separated line tokenises to a single token, so
+that whole line became the *method*, and the server answered a verb negotiation
+for a request that was never valid.
+
+`parseRequestLine` now returns `?RequestLine` — no method, no target, or a method
+that is not an RFC 9110 token is `null` — and `routeRequest` turns that into a
+400 before any route is consulted. The status is chosen by the router, like 404
+and 405, because the alternative was a handler having to remember to reject it.
+
+The token check is what makes the last case work: counting tokens cannot tell
+"the client forgot the method" from "the method is an odd word", because
+`/ HTTP/1.1` has two tokens. That line is malformed, but it parses as a request
+for the literal path `HTTP/1.1` and would answer 404. RFC 9110 defines
+`method = token`, and a token cannot contain a separator, so the method is
+validated against `tchar`.
+
+After:
+
+```
+A blank request line          -> 400 Bad Request  body[12] b'bad request\n'
+B bare GET, no path           -> 400 Bad Request  body[12] b'bad request\n'
+C method + space, no path     -> 400 Bad Request  body[12] b'bad request\n'
+D spaces only                 -> 400 Bad Request  body[12] b'bad request\n'
+E tab-separated request line  -> 400 Bad Request  body[12] b'bad request\n'
+F single LF                   -> 400 Bad Request  body[12] b'bad request\n'
+
+G valid GET /                 -> 200 OK  5744 bytes
+I valid GET /api/telemetry    -> 200 OK  live JSON
+J valid POST /api/control     -> 200 OK  {"ok":true}
+K valid HEAD /                -> 200 OK  unchanged
+L leading space, still valid  -> 200 OK
+```
+
+The 400 body is 12 bytes and does not leak the dashboard; that is asserted in a
+test, not just observed here. `BREW` still answers 405 because it is a valid token
+and simply is not a method this server serves.
 
 ### A gate hole this work hit
 
@@ -277,8 +330,9 @@ dead code behind a green gate.
 
 1. **Make `check` build the executable** — the gate currently passes on code
    that cannot link into a server. Found the hard way on PR #4.
-2. **Return 400 for an unparseable request line**, and send no body for HEAD.
-   Both are known and confirmed reachable from the real surface.
+2. **Send no body for HEAD.** `HEAD /` returns 200 with a 5744-byte body, which
+   RFC 9110 forbids. Known and confirmed reachable; deliberately kept separate
+   from the malformed-request fix rather than bundled with it.
 3. **Multi-segment pool** — the tier resolver sums free space across roots and
    holds `RESERVE_BYTES` per volume (PR #1), but the pool is still a single file
    on a single volume, so nothing is gained on disk yet.
@@ -288,7 +342,8 @@ dead code behind a green gate.
    machine. Nothing re-measures it, so the next edit can quietly make it stale
    the way the hardcoded `0.08` did — as the probe count already did once.
 
-Resolved since this list was first written: the hardcoded `0.08` ratio (PR #3).
+Resolved since this list was first written: the hardcoded `0.08` ratio (PR #3),
+and 400 for a malformed request line (this branch).
 
 ## Running things
 
