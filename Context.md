@@ -17,16 +17,19 @@ re-ran is worse than no number.
 
 ## Repository state
 
-`main` history, oldest first, every entry a squash merge:
+`main` history, oldest first. The first four rows are direct commits; every row
+with a PR number is a squash merge of that pull request:
 
 | Commit | PR | Subject |
 |---|---|---|
+| `03815a4` | — | Initial commit: DPU disk-backed VRAM engine and Vulkan ICD |
 | `b0d61f3` | — | pool lock cross-process, probe exits honestly |
 | `858e41f` | — | hand back freed pool bytes, fix validated handles |
 | `4dfc254` | — | the copy path reports failure instead of wrong data |
 | `bf3dfca` | #1 | Hold the tier reserve per volume, not per pool |
 | `4b69d2a` | #2 | Make the loader stop corrupting command buffers, and run the probe |
 | `5fce630` | #3 | Stop dividing a measurement by a hardcoded constant |
+| `2225369` | #4 | Let the router pick the status, so a miss cannot answer 200 |
 
 Two of those merges were not requested by the automation in flight:
 
