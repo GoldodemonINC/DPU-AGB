@@ -14,6 +14,20 @@ bytes on disk`.
 Until now the probe had never been executed. Every runtime claim about the
 driver was unsubstantiated; this is the first run, and it is green.
 
+## Repository state
+
+- `main` is at `bf3dfca`, a **squash merge of PR #1** ("Hold the tier reserve
+  per volume, not per pool"), merged at 2026-10-03T18:06:35Z. It brought in
+  `tiers.zig`, `pool.zig` and `server.zig`.
+  Note: the merge was performed by the `Goldodemon-Automation` credential
+  while the automation was mid-run on a different branch, and was not
+  requested by the task in flight. The squash commit is attributed to the PR
+  author (`Goldodemon <dominickroman38@gmail.com>`), which is what GitHub does
+  for a squash merge; `merged_by` is the automation account. Treated as
+  settled history, not reverted.
+- **PR #2** (`fix/icd-dispatchable-handle-unwrap`) is open against `main`,
+  rebased onto `bf3dfca`, and not set to auto-merge.
+
 ## What changed in this commit
 
 ### 1. Four command entry points had a phantom leading parameter
