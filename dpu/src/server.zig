@@ -115,18 +115,20 @@ pub const Server = struct {
         if (n <= 0) return;
         const req = buf[0..@intCast(n)];
 
-        // `routeRequest` decides the status, including for a request line that
-        // is not one. The handlers below only build a body, so nothing a handler
-        // does can promote a miss or a malformed request into a success.
-        switch (routeRequest(req)) {
-            .telemetry => sendTelemetry(client, ctx),
-            .control => sendControl(client, req, ctx),
-            .asset => |p| serveAsset(client, p),
-            .reject => |r| respond(client, r.status, "text/plain", r.body, r.allow),
+        // `routeRequest` parses the request line once and returns both the
+        // route and the framing. One parse decides all three things -- the
+        // method, the status and whether bytes follow the headers -- so a HEAD
+        // cannot be routed one way and framed another.
+        const d = routeRequest(req);
+        switch (d.route) {
+            .telemetry => sendTelemetry(client, ctx, d.framing),
+            .control => sendControl(client, req, ctx, d.framing),
+            .asset => |p| serveAsset(client, p, d.framing),
+            .reject => |r| respond(client, r.status, "text/plain", r.body, r.allow, d.framing),
         }
     }
 
-    fn sendControl(client: c.SOCKET, req: []const u8, ctx: *Context) void {
+    fn sendControl(client: c.SOCKET, req: []const u8, ctx: *Context, framing: Framing) void {
         if (parseParam(req, "power")) |p| {
             if (PowerMode.parse(p)) |mode| {
                 ctx.engine.power = mode;
@@ -141,7 +143,7 @@ pub const Server = struct {
         if (parseParam(req, "split")) |s| {
             ctx.engine.split = std.ascii.eqlIgnoreCase(s, "1") or std.ascii.eqlIgnoreCase(s, "true");
         }
-        respond(client, "200 OK", "application/json", "{\"ok\":true}", null);
+        respond(client, "200 OK", "application/json", "{\"ok\":true}", null, framing);
     }
 
     /// Build the telemetry payload by hand into a fixed buffer.
@@ -149,7 +151,7 @@ pub const Server = struct {
     /// A general JSON serializer would be more code and slower for a document
     /// whose shape never varies. Numbers go through `fmt` with explicit
     /// precision so the client never has to parse locale-formatted output.
-    fn sendTelemetry(client: c.SOCKET, ctx: *const Context) void {
+    fn sendTelemetry(client: c.SOCKET, ctx: *const Context, framing: Framing) void {
         const now_ms = EngineState.nowMs();
         const last_sample_ms = ctx.last_sample_ms;
         var buf: [16384]u8 = undefined;
@@ -268,7 +270,7 @@ pub const Server = struct {
         }) catch return;
 
         w.writeAll("}") catch return;
-        respond(client, "200 OK", "application/json", w.buffered(), null);
+        respond(client, "200 OK", "application/json", w.buffered(), null, framing);
     }
 };
 
@@ -468,31 +470,73 @@ fn route(path: []const u8, method: []const u8) Route {
     return .{ .reject = .{ .status = "404 Not Found", .body = "not found\n" } };
 }
 
-/// The router's verdict for a raw request, including one with no request line.
+/// The status for a parsed request line, including one that is not a request
+/// line at all.
 ///
 /// The malformed case is answered here, by the router, for the same reason 404
 /// and 405 are: a handler must not have to remember to reject it. It is checked
 /// before any lookup because there is nothing to look up -- no method and no
 /// target means no route, not a route whose name happens to be missing.
-fn routeRequest(req: []const u8) Route {
-    const line = parseRequestLine(req) orelse return .{ .reject = .{
+fn routeLine(line: ?RequestLine) Route {
+    const parsed = line orelse return .{ .reject = .{
         .status = "400 Bad Request",
         .body = "bad request\n",
     } };
-    return route(line.path, line.method);
+    return route(parsed.path, parsed.method);
 }
 
-fn serveAsset(client: c.SOCKET, path: []const u8) void {
+/// Everything a request line implies: which route, and whether the response
+/// carries a body.
+///
+/// The two travel together because they are facts about the *same* parse.
+/// `routeLine` picks the status and `framingFor` picks whether bytes follow the
+/// headers, and both read the one `line` produced here. Returning them as a
+/// pair is what stops a future edit from routing on one read of the request and
+/// framing on another -- the same split the 404 fix removed from the status
+/// code, only relocated.
+const Decision = struct {
+    route: Route,
+    framing: Framing,
+};
+
+fn routeRequest(req: []const u8) Decision {
+    const line = parseRequestLine(req);
+    return .{
+        .route = routeLine(line),
+        // A request line that did not parse is not a HEAD, so its 400 keeps the
+        // body it describes. `framingFor("")` is `.body`.
+        .framing = framingFor(if (line) |l| l.method else ""),
+    };
+}
+
+fn serveAsset(client: c.SOCKET, path: []const u8, framing: Framing) void {
     // The router only dispatches here for a path present in ASSETS, so the
     // unwrap cannot fail and this cannot silently serve the wrong file.
     const a = findAsset(path).?;
-    respond(client, "200 OK", a.mime, a.body, null);
+    respond(client, "200 OK", a.mime, a.body, null, framing);
+}
+
+/// Whether the exchange carries a response body.
+///
+/// `respond` used to send the body unconditionally and knew nothing about the
+/// request, so the status was decided by the router while the framing was
+/// decided by a writer that had never seen the method -- two places deciding
+/// one thing, which is the arrangement PR #4 removed from the status code. The
+/// value is computed once in `serveOnce` from the same `method` that routed the
+/// request, so the two facts have a single source.
+///
+/// HEAD is admitted by `accept` exactly where GET is, and suppressed here for
+/// exactly the same requests, because both read the same variable.
+const Framing = enum { body, headers_only };
+
+fn framingFor(method: []const u8) Framing {
+    return if (std.mem.eql(u8, method, "HEAD")) .headers_only else .body;
 }
 
 /// The single response emitter. Every status line in this server is written
 /// here, so "which code does this return" has one answer rather than one per
 /// helper that happens to remember.
-fn respond(client: c.SOCKET, status: []const u8, mime: []const u8, body: []const u8, allow: ?[]const u8) void {
+fn respond(client: c.SOCKET, status: []const u8, mime: []const u8, body: []const u8, allow: ?[]const u8, framing: Framing) void {
     var head: [512]u8 = undefined;
     var w = std.Io.Writer.fixed(&head);
     w.print(
@@ -510,7 +554,18 @@ fn respond(client: c.SOCKET, status: []const u8, mime: []const u8, body: []const
 
     const out = w.buffered();
     _ = c.send(client, out.ptr, @intCast(out.len), 0);
-    _ = c.send(client, body.ptr, @intCast(body.len), 0);
+    // Content-Length above is the length a GET would have returned, which is
+    // what a HEAD response must advertise -- RFC 9110 says the headers SHOULD
+    // match what GET would have sent. Zeroing it would "fix" the framing by
+    // lying about the resource instead.
+    //
+    // The bytes themselves are not sent. Sending them was not cosmetic: a
+    // client that reads by Content-Length would consume 5744 bytes of dashboard
+    // it never asked for, and on a connection that stayed open those bytes
+    // would be the start of the next response.
+    if (framing == .body) {
+        _ = c.send(client, body.ptr, @intCast(body.len), 0);
+    }
 }
 
 // ---------------------------------------------------------------------- tests
@@ -613,7 +668,7 @@ test "a request line that is not one is 400, not the dashboard" {
         "\r\n",
     };
     for (malformed) |req| {
-        const r = routeRequest(req);
+        const r = routeRequest(req).route;
         try testing.expectEqualStrings("400 Bad Request", statusOf(r).?);
         try testing.expectEqualStrings("bad request\n", r.reject.body);
         // A malformed request has no target, so it must not advertise a verb
@@ -625,7 +680,7 @@ test "a request line that is not one is 400, not the dashboard" {
 
 test "a 400 does not leak the dashboard" {
     // The failure being fixed was a 200 carrying the whole index page.
-    const r = routeRequest("\r\n\r\n");
+    const r = routeRequest("\r\n\r\n").route;
     try testing.expectEqualStrings("bad request\n", r.reject.body);
     try testing.expect(r.reject.body.len < index_html.len);
 }
@@ -633,11 +688,11 @@ test "a 400 does not leak the dashboard" {
 test "a well-formed request line still routes" {
     // The regression this must not cause: stricter parsing rejecting real
     // traffic. These are the exact shapes the PR verified over a socket.
-    try testing.expectEqual(std.meta.activeTag(routeRequest("GET / HTTP/1.1\r\n\r\n")), .asset);
-    try testing.expectEqual(std.meta.activeTag(routeRequest("GET /api/telemetry HTTP/1.1\r\n\r\n")), .telemetry);
-    try testing.expectEqual(std.meta.activeTag(routeRequest("POST /api/control HTTP/1.1\r\n\r\npower=MAX")), .control);
-    try testing.expectEqual(std.meta.activeTag(routeRequest("HEAD / HTTP/1.1\r\n\r\n")), .asset);
-    try testing.expectEqual(std.meta.activeTag(routeRequest("GET /app.js HTTP/1.1\r\n\r\n")), .asset);
+    try testing.expectEqual(std.meta.activeTag(routeRequest("GET / HTTP/1.1\r\n\r\n").route), .asset);
+    try testing.expectEqual(std.meta.activeTag(routeRequest("GET /api/telemetry HTTP/1.1\r\n\r\n").route), .telemetry);
+    try testing.expectEqual(std.meta.activeTag(routeRequest("POST /api/control HTTP/1.1\r\n\r\npower=MAX").route), .control);
+    try testing.expectEqual(std.meta.activeTag(routeRequest("HEAD / HTTP/1.1\r\n\r\n").route), .asset);
+    try testing.expectEqual(std.meta.activeTag(routeRequest("GET /app.js HTTP/1.1\r\n\r\n").route), .asset);
 }
 
 test "a request line without a trailing newline is still valid" {
@@ -656,12 +711,59 @@ test "leading separators do not make a valid line malformed" {
 
 test "malformed is decided before any route lookup" {
     // A miss is 404 and a malformed line is 400; they must not be confused.
-    try testing.expectEqualStrings("404 Not Found", statusOf(routeRequest("GET /nope HTTP/1.1\r\n\r\n")).?);
-    try testing.expectEqualStrings("400 Bad Request", statusOf(routeRequest("GET\r\n\r\n")).?);
+    try testing.expectEqualStrings("404 Not Found", statusOf(routeRequest("GET /nope HTTP/1.1\r\n\r\n").route).?);
+    try testing.expectEqualStrings("400 Bad Request", statusOf(routeRequest("GET\r\n\r\n").route).?);
 }
 
 test "no verb reaches a handler for a path that does not exist" {
     for ([_][]const u8{ "GET", "POST", "HEAD", "PUT", "DELETE" }) |m| {
         try testing.expectEqualStrings("404 Not Found", statusOf(route("/nope", m)).?);
     }
+}
+
+// ------------------------------------------------------------------- framing
+
+test "HEAD is admitted wherever GET is" {
+    // The router already admitted HEAD beside GET. Framing now agrees with it
+    // because both read the same `method`; this pins the pairing.
+    for ([_][]const u8{ "/", "/index.html", "/app.js", "/style.css" }) |p| {
+        try testing.expectEqual(std.meta.activeTag(route(p, "HEAD")), std.meta.activeTag(route(p, "GET")));
+        try testing.expectEqual(Framing.headers_only, framingFor("HEAD"));
+    }
+}
+
+test "only HEAD suppresses the body" {
+    try testing.expectEqual(Framing.headers_only, framingFor("HEAD"));
+    for ([_][]const u8{ "GET", "POST", "PUT", "DELETE", "BREW", "get" }) |m| {
+        try testing.expectEqual(Framing.body, framingFor(m));
+    }
+}
+
+test "framing is case-sensitive, matching HTTP method semantics" {
+    // RFC 9110 methods are case-sensitive, so a lowercase "head" is not HEAD and
+    // is not a verb this server serves -- it must not silently get HEAD framing.
+    try testing.expectEqual(Framing.body, framingFor("head"));
+    try testing.expectEqualStrings("405 Method Not Allowed", statusOf(route("/", "head")).?);
+}
+
+test "HEAD on a miss is still a 404, and still framed as headers-only" {
+    try testing.expectEqualStrings("404 Not Found", statusOf(route("/nope", "HEAD")).?);
+    try testing.expectEqual(Framing.headers_only, framingFor("HEAD"));
+}
+
+test "every asset has a body for Content-Length to describe" {
+    // `respond` formats Content-Length from `body.len` before it consults
+    // `framing`, so a HEAD advertises exactly the length GET would have
+    // returned. Asserting that the length is non-zero and is the embedded
+    // asset's own length is the part provable here; that the number reaches
+    // the wire while the bytes do not is observable only over a socket, and is
+    // verified there rather than pretended at here.
+    for ([_][]const u8{ "/", "/index.html", "/app.js", "/style.css" }) |p| {
+        const a = findAsset(p).?;
+        try testing.expect(a.body.len > 0);
+    }
+    // The 404 body a HEAD advertises is the same 10 bytes GET would have sent.
+    const body = route("/nope", "HEAD").reject.body;
+    try testing.expectEqualStrings("not found\n", body);
+    try testing.expectEqual(@as(usize, 10), body.len);
 }

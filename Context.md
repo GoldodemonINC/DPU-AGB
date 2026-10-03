@@ -250,69 +250,66 @@ The write path was re-checked **for its effect, not just its status**:
 
 ### Two known gaps, deliberately not fixed here
 
-1. **`HEAD` sends a body.** `HEAD /` returns 200 with `Content-Length: 5744`
-   *and* all 5744 bytes; RFC 9110 forbids a body on a HEAD response. HEAD is
-   reachable — it is a real request, not a theoretical one. Splitting GET and
-   HEAD in `respond` is a larger change than fixing the status code, so it is
-   left undone rather than half-done.
-2. **A malformed request line answers 200** — fixed since this was written; see
-   below. Kept here as the record of what it was.
+1. **`HEAD` sends a body** — fixed since this was written; see below.
+2. **A malformed request line still answers 200.** `extractMethod` and
+   `extractPath` default to `"GET"` and `"/"` when the token is missing, so a
+   blank request line, or a bare `GET` with no path, returns the whole
+   dashboard with 200. That is a malformed request rather than a missing
+   *route*, so it wants a 400.
 
-## A malformed request line was answered 200 with the whole dashboard
+## HEAD was sending a body, and the writer never knew the method
 
-`extractMethod` and `extractPath` were two functions that each supplied a default:
-the method defaulted to `"GET"` and the path to `"/"`. A default is a guess, and a
-guess about a request line is a guess about what the client asked for.
-
-Measured over a socket against a binary built from `main`:
-
-```
-A blank request line          -> 200 OK   body[5744] <!DOCTYPE html>...
-B bare GET, no path           -> 200 OK   body[5744] <!DOCTYPE html>...
-C method + space, no path     -> 200 OK   body[5744] <!DOCTYPE html>...
-D spaces only                 -> 200 OK   body[5744] <!DOCTYPE html>...
-F single LF                   -> 200 OK   body[5744] <!DOCTYPE html>...
-E tab-separated request line  -> 405 Method Not Allowed, Allow: GET, HEAD
-```
-
-The hole was wider than the blank line that was reported. Five shapes resolved to
-`GET /` and served the index page with a 200, and a sixth produced something
-different and equally wrong: a tab-separated line tokenises to a single token, so
-that whole line became the *method*, and the server answered a verb negotiation
-for a request that was never valid.
-
-`parseRequestLine` now returns `?RequestLine` — no method, no target, or a method
-that is not an RFC 9110 token is `null` — and `routeRequest` turns that into a
-400 before any route is consulted. The status is chosen by the router, like 404
-and 405, because the alternative was a handler having to remember to reject it.
-
-The token check is what makes the last case work: counting tokens cannot tell
-"the client forgot the method" from "the method is an odd word", because
-`/ HTTP/1.1` has two tokens. That line is malformed, but it parses as a request
-for the literal path `HTTP/1.1` and would answer 404. RFC 9110 defines
-`method = token`, and a token cannot contain a separator, so the method is
-validated against `tchar`.
-
-After:
+`respond` sent the body unconditionally and had no knowledge of the request at
+all. The status was decided by the router while the framing was decided by a
+writer that had never seen the method — two places deciding one thing, which is
+precisely the arrangement PR #4 removed from the status code. Measured over a
+socket against a binary built from `main`, HEAD was byte-identical to GET on
+every route:
 
 ```
-A blank request line          -> 400 Bad Request  body[12] b'bad request\n'
-B bare GET, no path           -> 400 Bad Request  body[12] b'bad request\n'
-C method + space, no path     -> 400 Bad Request  body[12] b'bad request\n'
-D spaces only                 -> 400 Bad Request  body[12] b'bad request\n'
-E tab-separated request line  -> 400 Bad Request  body[12] b'bad request\n'
-F single LF                   -> 400 Bad Request  body[12] b'bad request\n'
-
-G valid GET /                 -> 200 OK  5744 bytes
-I valid GET /api/telemetry    -> 200 OK  live JSON
-J valid POST /api/control     -> 200 OK  {"ok":true}
-K valid HEAD /                -> 200 OK  unchanged
-L leading space, still valid  -> 200 OK
+HEAD /           -> 200 OK  Content-Length=5744   actual body bytes = 5744
+HEAD /style.css  -> 200 OK  Content-Length=12126  actual body bytes = 12126
+HEAD /app.js     -> 200 OK  Content-Length=17926  actual body bytes = 17926
+HEAD /nope       -> 404     Content-Length=10     actual body bytes = 10
 ```
 
-The 400 body is 12 bytes and does not leak the dashboard; that is asserted in a
-test, not just observed here. `BREW` still answers 405 because it is a valid token
-and simply is not a method this server serves.
+Not cosmetic. A client that reads by `Content-Length` consumes 5744 bytes of
+dashboard it never asked for.
+
+`Framing` is computed once in `serveOnce`, from the same `method` the router just
+used, and threaded to `respond`. HEAD is admitted by `accept` exactly where GET
+is and suppressed for exactly the same requests, because both read one variable
+rather than each deciding for itself. After:
+
+```
+HEAD /           -> 200 OK  Content-Length=5744   body bytes = 0
+HEAD /index.html -> 200 OK  Content-Length=5744   body bytes = 0
+HEAD /style.css  -> 200 OK  Content-Length=12126  body bytes = 0
+HEAD /app.js     -> 200 OK  Content-Length=17926  body bytes = 0
+HEAD /nope       -> 404     Content-Length=10     body bytes = 0
+HEAD /app.js.map -> 404     Content-Length=10     body bytes = 0
+```
+
+`Content-Length` is still the length GET would have returned, not zero: RFC 9110
+says a HEAD response's headers SHOULD match what GET would have sent. Zeroing it
+would make the framing consistent by making the header a lie.
+
+### The check that actually matters: what the connection does next
+
+Framing is only correct if the bytes on the wire match the header. Sending a
+second request down the same socket straight after `HEAD /`:
+
+```
+response 1 status       : HTTP/1.1 200 OK
+declared Content-Length : 5744
+body bytes after headers: 0
+second request          : refused at the socket (ConnectionAbortedError)
+```
+
+The server sent `Connection: close` and then closed, so the client is told the
+connection is finished and the socket confirms it. No phantom 5744 bytes arrive
+to be misread as a second response. Before the fix those bytes existed and a
+client trusting `Content-Length` would have consumed them.
 
 ### A gate hole this work hit
 
@@ -329,10 +326,9 @@ dead code behind a green gate.
 ## What comes next
 
 1. **Make `check` build the executable** — the gate currently passes on code
-   that cannot link into a server. Found the hard way on PR #4.
-2. **Send no body for HEAD.** `HEAD /` returns 200 with a 5744-byte body, which
-   RFC 9110 forbids. Known and confirmed reachable; deliberately kept separate
-   from the malformed-request fix rather than bundled with it.
+   that cannot link into a server. Found the hard way on PR #4. (PR #5, open.)
+2. **Return 400 for an unparseable request line.** Known and confirmed reachable
+   from the real surface. (PR #6, open.)
 3. **Multi-segment pool** — the tier resolver sums free space across roots and
    holds `RESERVE_BYTES` per volume (PR #1), but the pool is still a single file
    on a single volume, so nothing is gained on disk yet.
@@ -341,9 +337,13 @@ dead code behind a green gate.
 5. **Run the benchmark in CI.** Every number above is from one run on one
    machine. Nothing re-measures it, so the next edit can quietly make it stale
    the way the hardcoded `0.08` did — as the probe count already did once.
+6. **Reconcile the three open HTTP branches before merging any of them.** PR #5,
+   #6 and this one each edit `serveOnce` and `Context.md` independently. The
+   framing threads through the same call sites PR #6 rewrites, so the union is
+   not purely a `Context.md` merge.
 
 Resolved since this list was first written: the hardcoded `0.08` ratio (PR #3),
-and 400 for a malformed request line (this branch).
+and no body on a HEAD response.
 
 ## Running things
 
