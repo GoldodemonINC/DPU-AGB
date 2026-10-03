@@ -397,11 +397,20 @@ pub fn build(b: *std.Build) void {
     // also assert formatting is a suite where the formatting silently rots.
     // `zig fmt --check` was failing on all sixteen sources, so this step is
     // only honest now that the tree has been formatted.
-    const check_step = b.step("check", "Formatting, unit tests and Vulkan ABI assertions");
+    //
+    // The gate also builds `dpu.exe`. Every test compiles its own root module,
+    // and since PR #4 the server is one of them -- but `main.zig` is not any
+    // test's root. A compile error there left `check` reporting 88/88 and
+    // exiting 0 while `zig build` failed outright, so the gate could not fail
+    // on the artifact the project actually ships. That is the whole point of a
+    // gate: if it cannot go red, its green means nothing. The install step is
+    // therefore a dependency here like the rest.
+    const check_step = b.step("check", "Formatting, unit tests, Vulkan ABI assertions, and the server executable");
     check_step.dependOn(&b.addFmt(.{
         .paths = &.{ "build.zig", "src", "web" },
         .check = true,
     }).step);
+    check_step.dependOn(b.getInstallStep());
     check_step.dependOn(&run_tests.step);
     check_step.dependOn(&run_tiers_tests.step);
     check_step.dependOn(&run_icd_tests.step);
