@@ -197,6 +197,13 @@ pub fn build(b: *std.Build) void {
     test_mod.linkSystemLibrary("pdh", .{});
     test_mod.linkSystemLibrary("psapi", .{});
     test_mod.linkSystemLibrary("ws2_32", .{});
+    // server.zig embeds the dashboard through this package, so the test root
+    // needs the same import or it cannot compile the file at all.
+    test_mod.addAnonymousImport("web_assets", .{
+        .root_source_file = b.path("web/assets.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     // cImport of the vendored Vulkan headers needs the third_party include
     // root, otherwise @cInclude("vulkan/vulkan_core.h") cannot resolve.
     test_mod.addIncludePath(b.path("third_party"));
