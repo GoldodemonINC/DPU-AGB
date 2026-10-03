@@ -115,16 +115,13 @@ pub const Server = struct {
         if (n <= 0) return;
         const req = buf[0..@intCast(n)];
 
-        const path = extractPath(req);
-        const method = extractMethod(req);
-
-        // `route` decides the status; the handlers below only build a body.
-        // Nothing a handler does can promote a miss into a success, because no
-        // handler holds a status to set.
-        switch (route(path, method)) {
+        // `routeRequest` decides the status, including for a request line that
+        // is not one. The handlers below only build a body, so nothing a handler
+        // does can promote a miss or a malformed request into a success.
+        switch (routeRequest(req)) {
             .telemetry => sendTelemetry(client, ctx),
             .control => sendControl(client, req, ctx),
-            .asset => serveAsset(client, path),
+            .asset => |p| serveAsset(client, p),
             .reject => |r| respond(client, r.status, "text/plain", r.body, r.allow),
         }
     }
@@ -294,23 +291,52 @@ pub const Context = struct {
 /// The router used to dispatch on path alone, so `POST /api/telemetry` was
 /// served as a GET and `GET /api/control` reported `{"ok":true}` having done
 /// nothing. The verb is part of the route, not an optional detail on it.
-fn extractMethod(req: []const u8) []const u8 {
+/// A request line that carried both a method and a target.
+const RequestLine = struct {
+    method: []const u8,
+    path: []const u8,
+};
+
+/// Parse `GET /path HTTP/1.1`, or return null when the line is not one.
+///
+/// These were two functions that each supplied their own default: the method
+/// defaulted to `"GET"` and the path to `"/"`. A default is a guess, and a
+/// guess about a request line is a guess about what the client asked for -- a
+/// blank line or a bare `GET` resolved to the dashboard and answered 200, so a
+/// client trusting the status code read a valid response to a request it never
+/// made. It also produced a wrong answer rather than none: a tab-separated line
+/// tokenised to a single token, that token became the *method*, and the result
+/// was a 405 advertising `Allow: GET, HEAD` for a request that was never valid.
+///
+/// RFC 9112 defines the request line as method SP request-target SP
+/// HTTP-version. Anything short of a method and a target is malformed, and the
+/// honest answer is to say so rather than invent one.
+fn parseRequestLine(req: []const u8) ?RequestLine {
     const line_end = std.mem.indexOfScalar(u8, req, '\n') orelse req.len;
     const line = std.mem.trimEnd(u8, req[0..line_end], "\r ");
     var it = std.mem.tokenizeAny(u8, line, " ");
-    return it.next() orelse "GET";
+    const method = it.next() orelse return null;
+    // A count of tokens cannot tell "the client forgot the method" from "the
+    // method is an odd word", because `/ HTTP/1.1` has two tokens. RFC 9110
+    // defines `method = token` and a token cannot contain a separator, so this
+    // is what stops a missing method being routed as a request for the literal
+    // path "HTTP/1.1" and answered 404.
+    if (!isMethodToken(method)) return null;
+    const target = it.next() orelse return null;
+    // Ignore any query string; control arrives over POST bodies instead.
+    const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
+    return .{ .method = method, .path = path };
 }
 
-/// Extract the path from an HTTP request line: `GET /path HTTP/1.1`.
-fn extractPath(req: []const u8) []const u8 {
-    const line_end = std.mem.indexOfScalar(u8, req, '\n') orelse req.len;
-    const line = std.mem.trimEnd(u8, req[0..line_end], "\r ");
-    var it = std.mem.tokenizeAny(u8, line, " ");
-    _ = it.next() orelse return "/"; // method
-    const path = it.next() orelse return "/";
-    // Ignore any query string; control arrives over POST bodies instead.
-    if (std.mem.indexOfScalar(u8, path, '?')) |q| return path[0..q];
-    return path;
+/// True for the characters RFC 9110 permits in a method token: `tchar`.
+fn isMethodToken(m: []const u8) bool {
+    if (m.len == 0) return false;
+    for (m) |ch| switch (ch) {
+        'a'...'z', 'A'...'Z', '0'...'9' => {},
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+        else => return false,
+    };
+    return true;
 }
 
 /// The request body is everything after the header/body separator.
@@ -382,8 +408,8 @@ const Route = union(enum) {
     telemetry,
     /// Apply a control write.
     control,
-    /// Serve one of the embedded dashboard assets.
-    asset,
+    /// Serve the embedded dashboard asset at this path.
+    asset: []const u8,
     /// Refuse.
     reject: Rejection,
 };
@@ -437,9 +463,23 @@ fn route(path: []const u8, method: []const u8) Route {
     }
     if (isAssetPath(path)) {
         if (accept(method, "GET")) |why| return .{ .reject = why };
-        return .asset;
+        return .{ .asset = path };
     }
     return .{ .reject = .{ .status = "404 Not Found", .body = "not found\n" } };
+}
+
+/// The router's verdict for a raw request, including one with no request line.
+///
+/// The malformed case is answered here, by the router, for the same reason 404
+/// and 405 are: a handler must not have to remember to reject it. It is checked
+/// before any lookup because there is nothing to look up -- no method and no
+/// target means no route, not a route whose name happens to be missing.
+fn routeRequest(req: []const u8) Route {
+    const line = parseRequestLine(req) orelse return .{ .reject = .{
+        .status = "400 Bad Request",
+        .body = "bad request\n",
+    } };
+    return route(line.path, line.method);
 }
 
 fn serveAsset(client: c.SOCKET, path: []const u8) void {
@@ -546,14 +586,78 @@ test "HEAD is accepted wherever GET is" {
 }
 
 test "the method comes off the request line" {
-    try testing.expectEqualStrings("GET", extractMethod("GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
-    try testing.expectEqualStrings("POST", extractMethod("POST /api/control HTTP/1.1\r\n\r\n"));
-    try testing.expectEqualStrings("DELETE", extractMethod("DELETE / HTTP/1.1\r\n\r\n"));
+    try testing.expectEqualStrings("GET", parseRequestLine("GET / HTTP/1.1\r\nHost: x\r\n\r\n").?.method);
+    try testing.expectEqualStrings("POST", parseRequestLine("POST /api/control HTTP/1.1\r\n\r\n").?.method);
+    try testing.expectEqualStrings("DELETE", parseRequestLine("DELETE / HTTP/1.1\r\n\r\n").?.method);
 }
 
 test "the path drops the query string" {
-    try testing.expectEqualStrings("/api/telemetry", extractPath("GET /api/telemetry?x=1 HTTP/1.1\r\n\r\n"));
-    try testing.expectEqualStrings("/", extractPath("GET /?x=1 HTTP/1.1\r\n\r\n"));
+    try testing.expectEqualStrings("/api/telemetry", parseRequestLine("GET /api/telemetry?x=1 HTTP/1.1\r\n\r\n").?.path);
+    try testing.expectEqualStrings("/", parseRequestLine("GET /?x=1 HTTP/1.1\r\n\r\n").?.path);
+}
+
+// ------------------------------------------------------------ malformed lines
+
+test "a request line that is not one is 400, not the dashboard" {
+    // Every one of these used to resolve to "GET /" and answer 200 with 5744
+    // bytes of dashboard, because the method defaulted to "GET" and the path
+    // to "/". Measured over a socket, not assumed.
+    const malformed = [_][]const u8{
+        "\r\n\r\n", // blank request line
+        "\n", // a bare newline
+        "GET\r\n\r\n", // method with no target
+        "GET \r\n\r\n", // method, separator, no target
+        "   \r\n", // separators only
+        "GET\t/\tHTTP/1.1\r\n\r\n", // tabs are not the SP separator
+        "/ HTTP/1.1\r\n\r\n", // target with no method
+        "\r\n",
+    };
+    for (malformed) |req| {
+        const r = routeRequest(req);
+        try testing.expectEqualStrings("400 Bad Request", statusOf(r).?);
+        try testing.expectEqualStrings("bad request\n", r.reject.body);
+        // A malformed request has no target, so it must not advertise a verb
+        // list -- that was how a tab-separated line produced a 405 promising
+        // "GET, HEAD" for a request that was never valid.
+        try testing.expect(r.reject.allow == null);
+    }
+}
+
+test "a 400 does not leak the dashboard" {
+    // The failure being fixed was a 200 carrying the whole index page.
+    const r = routeRequest("\r\n\r\n");
+    try testing.expectEqualStrings("bad request\n", r.reject.body);
+    try testing.expect(r.reject.body.len < index_html.len);
+}
+
+test "a well-formed request line still routes" {
+    // The regression this must not cause: stricter parsing rejecting real
+    // traffic. These are the exact shapes the PR verified over a socket.
+    try testing.expectEqual(std.meta.activeTag(routeRequest("GET / HTTP/1.1\r\n\r\n")), .asset);
+    try testing.expectEqual(std.meta.activeTag(routeRequest("GET /api/telemetry HTTP/1.1\r\n\r\n")), .telemetry);
+    try testing.expectEqual(std.meta.activeTag(routeRequest("POST /api/control HTTP/1.1\r\n\r\npower=MAX")), .control);
+    try testing.expectEqual(std.meta.activeTag(routeRequest("HEAD / HTTP/1.1\r\n\r\n")), .asset);
+    try testing.expectEqual(std.meta.activeTag(routeRequest("GET /app.js HTTP/1.1\r\n\r\n")), .asset);
+}
+
+test "a request line without a trailing newline is still valid" {
+    // A client that sends the line and stops is normal enough on loopback;
+    // rejecting it would be stricter than the bug being fixed.
+    const line = parseRequestLine("GET /api/telemetry HTTP/1.1").?;
+    try testing.expectEqualStrings("GET", line.method);
+    try testing.expectEqualStrings("/api/telemetry", line.path);
+}
+
+test "leading separators do not make a valid line malformed" {
+    const line = parseRequestLine("  GET / HTTP/1.1\r\n\r\n").?;
+    try testing.expectEqualStrings("GET", line.method);
+    try testing.expectEqualStrings("/", line.path);
+}
+
+test "malformed is decided before any route lookup" {
+    // A miss is 404 and a malformed line is 400; they must not be confused.
+    try testing.expectEqualStrings("404 Not Found", statusOf(routeRequest("GET /nope HTTP/1.1\r\n\r\n")).?);
+    try testing.expectEqualStrings("400 Bad Request", statusOf(routeRequest("GET\r\n\r\n")).?);
 }
 
 test "no verb reaches a handler for a path that does not exist" {

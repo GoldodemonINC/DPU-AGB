@@ -255,80 +255,95 @@ The write path was re-checked **for its effect, not just its status**:
    reachable — it is a real request, not a theoretical one. Splitting GET and
    HEAD in `respond` is a larger change than fixing the status code, so it is
    left undone rather than half-done.
-2. **A malformed request line still answers 200.** `extractMethod` and
-   `extractPath` default to `"GET"` and `"/"` when the token is missing, so a
-   blank request line, or a bare `GET` with no path, returns the whole
-   dashboard with 200. That is a malformed request rather than a missing
-   *route*, so it wants a 400.
+2. **A malformed request line answers 200** — fixed since this was written; see
+   below. Kept here as the record of what it was.
+
+## A malformed request line was answered 200 with the whole dashboard
+
+`extractMethod` and `extractPath` were two functions that each supplied a default:
+the method defaulted to `"GET"` and the path to `"/"`. A default is a guess, and a
+guess about a request line is a guess about what the client asked for.
+
+Measured over a socket against a binary built from `main`:
+
+```
+A blank request line          -> 200 OK   body[5744] <!DOCTYPE html>...
+B bare GET, no path           -> 200 OK   body[5744] <!DOCTYPE html>...
+C method + space, no path     -> 200 OK   body[5744] <!DOCTYPE html>...
+D spaces only                 -> 200 OK   body[5744] <!DOCTYPE html>...
+F single LF                   -> 200 OK   body[5744] <!DOCTYPE html>...
+E tab-separated request line  -> 405 Method Not Allowed, Allow: GET, HEAD
+```
+
+The hole was wider than the blank line that was reported. Five shapes resolved to
+`GET /` and served the index page with a 200, and a sixth produced something
+different and equally wrong: a tab-separated line tokenises to a single token, so
+that whole line became the *method*, and the server answered a verb negotiation
+for a request that was never valid.
+
+`parseRequestLine` now returns `?RequestLine` — no method, no target, or a method
+that is not an RFC 9110 token is `null` — and `routeRequest` turns that into a
+400 before any route is consulted. The status is chosen by the router, like 404
+and 405, because the alternative was a handler having to remember to reject it.
+
+The token check is what makes the last case work: counting tokens cannot tell
+"the client forgot the method" from "the method is an odd word", because
+`/ HTTP/1.1` has two tokens. That line is malformed, but it parses as a request
+for the literal path `HTTP/1.1` and would answer 404. RFC 9110 defines
+`method = token`, and a token cannot contain a separator, so the method is
+validated against `tchar`.
+
+After:
+
+```
+A blank request line          -> 400 Bad Request  body[12] b'bad request\n'
+B bare GET, no path           -> 400 Bad Request  body[12] b'bad request\n'
+C method + space, no path     -> 400 Bad Request  body[12] b'bad request\n'
+D spaces only                 -> 400 Bad Request  body[12] b'bad request\n'
+E tab-separated request line  -> 400 Bad Request  body[12] b'bad request\n'
+F single LF                   -> 400 Bad Request  body[12] b'bad request\n'
+
+G valid GET /                 -> 200 OK  5744 bytes
+I valid GET /api/telemetry    -> 200 OK  live JSON
+J valid POST /api/control     -> 200 OK  {"ok":true}
+K valid HEAD /                -> 200 OK  unchanged
+L leading space, still valid  -> 200 OK
+```
+
+The 400 body is 12 bytes and does not leak the dashboard; that is asserted in a
+test, not just observed here. `BREW` still answers 405 because it is a valid token
+and simply is not a method this server serves.
 
 ### A gate hole this work hit
 
-`zig build check` did **not** build the server binary — the step never compiled
-`main.zig`. A `switch` in `server.zig` that the test root did not reach passed
+`zig build check` does **not** build the server binary — the step never compiles
+`main.zig`. A `switch` in `server.zig` that the test root does not reach passed
 `check` at 88/88 and then failed `zig build` with `expected optional type, found
-'[]const u8'`.
-
+'[]const u8'`. Making `check_step` depend on the install step would close it.
 The same reasoning applies to test discovery: `zig build test` only finds tests
 in the root module and its relative imports, so `server.zig`'s tests needed
 `backend_test.zig` to pull the file in and `build.zig` to give the test root the
 same `web_assets` import the exe has. Without both, ten tests would have been
 dead code behind a green gate.
 
-## The gate now builds the server executable
-
-`check_step.dependOn(b.getInstallStep())` is the whole fix. The hole was measured,
-not assumed:
-
-With one well-formatted line added to `src/main.zig` — a call to
-`thisFunctionDoesNotExist()`, which compiles as formatting and fails as code:
-
-```
-BEFORE   zig build check -> Build Summary: 10/10 steps succeeded; 88/88 tests passed
-                           check success                        exit 0
-         zig build       -> src\main.zig:45:9: error: use of undeclared identifier
-                            'thisFunctionDoesNotExist'          exit 1
-
-AFTER    zig build check -> +- install transitive failure
-                             +- install dpu transitive failure
-                                +- compile exe dpu Debug native 1 errors
-                            src\main.zig:45:9: error: use of undeclared identifier
-                              'thisFunctionDoesNotExist'        exit 1
-```
-
-The same injection, same command, one line of `build.zig` between them.
-
-Note what the first case actually proved, because it is subtler than it looks.
-PR #4 wired `server.zig` into the test module, so a syntax error *there* does
-now fail the gate — the first attempt at reproducing this passed for the wrong
-reason. `main.zig` is the root of no test module at all, which is why an error in
-it stayed invisible. The general lesson: adding a file to a test root is not the
-same as building it, and a gate that only compiles what the tests happen to
-import cannot be relied on for the shipping binary.
-
-`zig build check` now also leaves `zig-out/bin/dpu.exe` behind, verified from a
-deleted `zig-out`. That is a side effect worth naming: the gate is no longer a
-pure verification step, it now writes build output.
-
 ## What comes next
 
-1. **Return 400 for an unparseable request line**, and send no body for HEAD.
-   Both are known and confirmed reachable from the real surface.
-2. **Multi-segment pool** — the tier resolver sums free space across roots and
+1. **Make `check` build the executable** — the gate currently passes on code
+   that cannot link into a server. Found the hard way on PR #4.
+2. **Send no body for HEAD.** `HEAD /` returns 200 with a 5744-byte body, which
+   RFC 9110 forbids. Known and confirmed reachable; deliberately kept separate
+   from the malformed-request fix rather than bundled with it.
+3. **Multi-segment pool** — the tier resolver sums free space across roots and
    holds `RESERVE_BYTES` per volume (PR #1), but the pool is still a single file
    on a single volume, so nothing is gained on disk yet.
-3. **Process-level pool locking test** — existing tests prove a *thread* releases
+4. **Process-level pool locking test** — existing tests prove a *thread* releases
    `Local\DPU.pool.lock`; none proves two *processes* cannot corrupt `pool.vram`.
-4. **Run the benchmark in CI.** Every number above is from one run on one
+5. **Run the benchmark in CI.** Every number above is from one run on one
    machine. Nothing re-measures it, so the next edit can quietly make it stale
    the way the hardcoded `0.08` did — as the probe count already did once.
-5. **Decide whether `check` should keep writing `zig-out`.** Making the gate
-   build the executable was necessary, but it also made a verification step
-   produce artifacts. If that is unwanted, the alternative is a compile-only
-   step (`addObject`/`addExecutable` without `installArtifact`) that proves the
-   build graph resolves without writing anything.
 
 Resolved since this list was first written: the hardcoded `0.08` ratio (PR #3),
-and `check` building the server executable.
+and 400 for a malformed request line (this branch).
 
 ## Running things
 
