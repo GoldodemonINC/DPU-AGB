@@ -130,9 +130,17 @@ pub const Allocator = struct {
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) !Allocator {
         const share = @min(cfg.stream_share_pct, 100);
-        const stream_bytes = roundUp(cfg.total * share / 100);
-        const reclaim_bytes = roundUp(cfg.total - stream_bytes);
-        if (stream_bytes == 0 or reclaim_bytes == 0) return Error.OutOfSpace;
+        // Clamped to `total` before the reclaim split, because roundUp can
+        // push a share of 100% past the pool and the subtraction below would
+        // underflow.
+        const stream_bytes = @min(roundUp(cfg.total * share / 100), cfg.total);
+        const reclaim_bytes = cfg.total - stream_bytes;
+
+        // A zero stream share is legal and is what the driver configures: a
+        // forward-only pool can never return a byte, so a client that frees
+        // and reallocates would leak the whole pool within a single session.
+        // Only a pool with no reclaim region is unusable.
+        if (reclaim_bytes == 0) return Error.OutOfSpace;
 
         var self: Allocator = .{
             .allocator = allocator,

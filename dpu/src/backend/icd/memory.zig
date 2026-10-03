@@ -118,7 +118,17 @@ pub const Backend = struct {
         // -- because the user dropped the tier -- the pool is left alone rather
         // than truncated: offsets a client already holds must stay valid.
         const total = @max(dev.ceiling, dev.file_size);
-        const pool_alloc = alloc.Allocator.init(allocator, .{ .total = total }) catch {
+        // stream_share_pct is zero on purpose. A `stream` allocation is forward-only:
+        // freeing one drops the VAT row but never returns the bytes, so a
+        // client that allocates and frees in a loop -- vulkaninfo does, many
+        // times per run -- walks the pool cursor to its end and then starts
+        // getting VK_ERROR_OUT_OF_DEVICE_MEMORY from a pool that is visibly
+        // empty. Reclaim costs a little fragmentation and is the only policy
+        // under which `vkFreeMemory` means anything.
+        const pool_alloc = alloc.Allocator.init(allocator, .{
+            .total = total,
+            .stream_share_pct = 0,
+        }) catch {
             dev.deinit();
             return Error.PoolUnavailable;
         };
@@ -165,11 +175,11 @@ pub const Backend = struct {
 
         if (heap != HEAP_DEVICE_LOCAL) return Error.NotDeviceLocal;
 
-        // `stream` for the reclaim path: weights and KV-cache-style data that
-        // genuinely are forward-only. Reclaim would let a client free and
-        // reallocate regions, which is right for scratch but wrong for model
-        // weights, and guessing wrong here silently overwrites live data.
-        const slice = self.pool_alloc.alloc(size, .stream) catch return Error.OutOfPool;
+        // Reclaim, not stream: see `Backend.open`. Weights and KV blocks would
+        // ideally be forward-only, but Vulkan gives the client the right to
+        // free any VkDeviceMemory at any time, and a driver that treats that
+        // as a no-op is a driver that exhausts its own pool.
+        const slice = self.pool_alloc.alloc(size, .reclaim) catch return Error.OutOfPool;
         return .{
             .heap = heap,
             .offset = slice.offset,

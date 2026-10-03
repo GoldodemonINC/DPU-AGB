@@ -338,8 +338,13 @@ fn vkEnumeratePhysicalDevicesImpl(
     pCount: ?*u32,
     pDevices: ?[*]?*anyopaque,
 ) callconv(.c) c_int {
+    // The count is written whether or not an array was supplied, and the array
+    // is only touched when the caller has already asked for room. Writing
+    // slot 0 regardless is a write past a zero-sized array.
     if (pCount) |n| n.* = 1;
-    if (pDevices) |list| list[0] = @ptrCast(&physical_device_singleton);
+    if (pDevices) |list| {
+        if (pCount == null or pCount.?.* >= 1) list[0] = @ptrCast(&physical_device_singleton);
+    }
     return 0;
 }
 
@@ -534,8 +539,11 @@ fn vkGetPhysicalDeviceMemoryPropertiesImpl(
 ) callconv(.c) void {
     const out = p orelse return;
     out.* = std.mem.zeroes(c.VkPhysicalDeviceMemoryProperties);
-    out.memoryTypeCount = mem.MEMORY_TYPE_COUNT;
-    out.memoryTypeCount = @min(mem.MEMORY_TYPE_COUNT, out.memoryTypeCount);
+    // Clamped against the ABI maximum rather than against itself. The old second
+    // line was `@min(x, x)` immediately after assigning x -- a bounds check
+    // that cannot fail, which is the worst kind: it reads as protection and
+    // protects nothing.
+    out.memoryTypeCount = @min(mem.MEMORY_TYPE_COUNT, c.VK_MAX_MEMORY_TYPES);
     out.memoryTypes[0] = .{
         // The pool. Not host-visible, and deliberately so: a client that could
         // map this directly would never pay the disk latency, and the whole
@@ -552,8 +560,7 @@ fn vkGetPhysicalDeviceMemoryPropertiesImpl(
         .heapIndex = mem.HEAP_HOST,
     };
 
-    out.memoryHeapCount = mem.HEAP_COUNT;
-    out.memoryHeapCount = @min(mem.HEAP_COUNT, out.memoryHeapCount);
+    out.memoryHeapCount = @min(mem.HEAP_COUNT, c.VK_MAX_MEMORY_HEAPS);
     out.memoryHeaps[mem.HEAP_DEVICE_LOCAL] = .{
         // The pool's granted tier. This is the number that decides how large a
         // model llama.cpp will try to offload, so it has to be the tier the
@@ -599,6 +606,7 @@ fn vkEnumerateDeviceQueueFamiliesImpl(
 ) callconv(.c) c_int {
     if (pCount) |n| n.* = 1;
     if (pProps) |p| {
+        if (pCount != null and pCount.?.* < 1) return 0;
         p[0] = .{
             // Compute and transfer, deliberately not graphics. A graphics bit
             // would invite clients to build render pipelines against a device
@@ -720,6 +728,14 @@ fn vkCreateDeviceImpl(
     const out = pDevice orelse return -1; // VK_ERROR_INITIALIZATION_FAILED
     const info = pCreateInfo orelse return -1;
 
+    // The process arena is recycled here, which is the only point at which it
+    // is safe: Vulkan requires every object created from a device to be
+    // destroyed before the device itself. Without this the 512 KiB arena was
+    // allocated once per device and never given back, so an application that
+    // creates and destroys devices in a loop -- vulkaninfo does, repeatedly --
+    // ran the driver out of handle space partway through its own run.
+    mem.arenaReset();
+
     var wanted: u32 = 1;
     if (info.queueCreateInfoCount > 0 and info.pQueueCreateInfos != null) {
         const qci = info.pQueueCreateInfos[0];
@@ -792,13 +808,19 @@ fn vkGetDeviceQueueImpl(
 }
 
 fn vkGetDeviceQueue2Impl(
-    _: ?*anyopaque,
+    device: ?*anyopaque,
     pQueueInfo: ?*const c.VkDeviceQueueInfo2,
     pQueue: ?*?*anyopaque,
 ) callconv(.c) void {
     const out = pQueue orelse return;
     const info = pQueueInfo orelse return;
-    vkGetDeviceQueueImpl(null, info.queueFamilyIndex, info.queueIndex, out);
+    // The device handle is this command's first argument, exactly as in
+    // vkGetDeviceQueue. It used to be dropped on the floor here, and the
+    // callee treats a null device as "no queue" rather than as an error --
+    // vkGetDeviceQueue has no VkResult to fail with. The net effect was that
+    // every client using vkGetDeviceQueue2 got VK_NULL_HANDLE, which is to say
+    // every client of a device advertising API 1.3.
+    vkGetDeviceQueueImpl(device, info.queueFamilyIndex, info.queueIndex, out);
 }
 
 // --------------------------------------------------------------- lifetime

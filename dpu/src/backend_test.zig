@@ -276,6 +276,38 @@ test "zero-length allocation is rejected" {
     try testing.expectError(error.Misaligned, a.alloc(0, .reclaim));
 }
 
+test "a zero stream share gives the whole pool to reclaim" {
+    // This is the configuration the Vulkan driver uses. With no stream region
+    // at all, every byte a client frees comes back, which is what makes
+    // vkFreeMemory mean anything.
+    var cfg = testCfg();
+    cfg.stream_share_pct = 0;
+    var a = try alloc.Allocator.init(testing.allocator, cfg);
+    defer a.deinit();
+
+    const st = a.stats();
+    try testing.expectEqual(@as(u64, 0), st.stream_total);
+    try testing.expectEqual(@as(u64, st.stream_total + st.reclaim_total), st.stream_total + st.reclaim_total);
+    try testing.expect(st.reclaim_total > 0);
+
+    // Allocate and free far more than the pool holds at once.
+    for (0..200) |_| {
+        const s = try a.alloc(256 * 1024, .reclaim);
+        a.free(s.vaddr);
+    }
+    const after = a.stats();
+    try testing.expectEqual(@as(usize, 1), after.free_extents);
+    try testing.expectEqual(after.reclaim_total, after.reclaim_free);
+    try testing.expectEqual(@as(u64, 0), after.reclaim_used);
+}
+
+test "a pool that is entirely forward-only is refused as unusable" {
+    var cfg = testCfg();
+    cfg.total = 4096;
+    cfg.stream_share_pct = 100;
+    try testing.expectError(error.OutOfSpace, alloc.Allocator.init(testing.allocator, cfg));
+}
+
 // ------------------------------------------------- block device integration
 
 // Aligned write, flush, read, and compare. This is the gate the whole
