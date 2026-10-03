@@ -5,20 +5,18 @@ applications as a discrete GPU through a user-mode installable client driver.
 
 ## Status at this commit
 
-`zig build check` — **88/88 tests**, exit 0, `zig fmt --check` clean.
+`zig build check` — **99/99 tests**, exit 0, `zig fmt --check` clean. The gate
+also builds `dpu.exe`, so a green run now means the shipping binary compiles.
 
 `zig build probe` — **50/50, exit 0**, closing with
 `PROBE_SUMMARY: total=50 passed=50 failed=0 result=PASS` and
 `RESULT: PASS -- the DPU heap carries real bytes on disk`.
 
-Both numbers were measured on this machine, not carried forward. An earlier copy
-of this file claimed the probe was 45/45; that was stale, and a number nobody
-re-ran is worse than no number.
+Every number here was measured on this machine for this tree. An earlier copy of
+this file claimed the probe was 45/45; that was stale, and a number nobody re-ran
+is worse than no number.
 
 ## Repository state
-
-`main` history, oldest first. The first four rows are direct commits; every row
-with a PR number is a squash merge of that pull request:
 
 | Commit | PR | Subject |
 |---|---|---|
@@ -30,113 +28,134 @@ with a PR number is a squash merge of that pull request:
 | `4b69d2a` | #2 | Make the loader stop corrupting command buffers, and run the probe |
 | `5fce630` | #3 | Stop dividing a measurement by a hardcoded constant |
 | `2225369` | #4 | Let the router pick the status, so a miss cannot answer 200 |
+| `caa8ab6` | — | Correct the merge-history table in Context.md |
 
-Two of those merges were not requested by the automation in flight:
+This branch is the union of three still-open PRs, none of which is merged:
 
-- **PR #1** merged at 2026-10-03T18:06:35Z by the `Goldodemon-Automation`
-  credential while a task was mid-run on another branch.
-- **PR #2** was intended to be *auto*-merged, not merged immediately. The call
-  was `PUT /pulls/2/merge` with `{"auto_merge": true, "merge_method": "squash"}`.
-  GitHub only honours that flag when the repository has **"Allow auto-merge"**
-  enabled; it does not, so the parameter was ignored and the endpoint merged on
-  the spot. The token in the OS credential store also cannot read or patch
-  repository settings — `GET /repos/.../DPU-AGB` returns **404** — so the setting
-  could not be enabled programmatically first.
+- **#5** `fix/check-must-build-the-exe` — the gate now builds the executable.
+- **#6** `fix/malformed-request-400` — 400 for a request line that is not one.
+- **#7** `fix/head-response-no-body` — no body on a HEAD response.
 
-Worth recording because that failure mode is quiet and irreversible: the request
-returns HTTP 200 and a merge SHA, and nothing in the response distinguishes
-"scheduled" from "already merged". Anything scripting this should re-read the
-PR afterwards and check `auto_merge`, rather than trusting the 200. Squash
-commits are attributed to the PR author, which is why they read as human
-commits; `merged_by` is the automation account.
+PR #1 merged at 2026-10-03T18:06:35Z by the `Goldodemon-Automation` credential
+while a task was mid-run on another branch; PR #2 was merged immediately when
+*auto*-merge was requested, because this repository does not have "Allow
+auto-merge" enabled, so the API's `auto_merge` flag is ignored and the endpoint
+merges on the spot. Both were unrequested and are treated as settled history.
+Squash commits read as human commits; `merged_by` is the automation account.
 
-Because `main` moved under PRs #3 and #4, both went dirty — each had written
-its own `Context.md` from scratch, so it was an add/add conflict on that one
-file. The code in each branch was unaffected and verified byte-identical across
-the rebase; both conflicts were resolved by union.
+## The HTTP surface
 
-## PR #2: four command entry points had a phantom leading parameter
+One request produces one `Decision`, and every response in this server comes from
+it. That is the whole design, and it is what the three open PRs together restore.
 
-Every `vkCmd*` function in `src/backend/icd/exec.zig` declared one extra
-leading `_: ?*anyopaque`, as if a `VkDevice` were passed first. Vulkan's
-command buffers take no device:
+```
+raw bytes -> parseRequestLine -> Decision{ route, framing } -> handler -> respond
+                  method         status              headers    headers only?
+```
 
-| Entry point | Vulkan | Had | Now |
-|---|---|---|---|
-| `vkCmdCopyBufferImpl` | 5 | 6 | 5 |
-| `vkCmdWriteBufferImpl` | 5 | 6 | 5 |
-| `vkCmdFillBufferImpl` | 5 | 6 | 5 |
-| `vkCmdPipelineBarrierImpl` | 10 | 11 | 10 |
+`parseRequestLine` is the only place that reads the method. `routeLine` is the
+only place that picks a status. `framingFor` is the only place that decides
+whether bytes follow the headers. All three read **one** parse, produced once in
+`routeRequest`, so no two of them can disagree about the same request.
 
-They are registered directly in the dispatch table, so nothing stripped the
-extra slot — it swallowed the real first argument. `vkCmdWriteBuffer` received
-the *buffer* where the command buffer belonged, rejected it, recorded nothing,
-and `vkQueueSubmit` cheerfully submitted an empty buffer. `vkQueueBindSparseImpl`
-(4 params) and `vkCreateFenceImpl` (device-first, correct) were audited and
-left alone.
+### Statuses the server can return
 
-**The sentinel was read from a word the loader owns.** `asCommandPool`,
-`asCommandBuffer` and `asFence` validated a magic `u32` at offset 0, but the
-loader writes its own dispatch pointer over the first 8 bytes of a dispatchable
-object — so the check read a pointer and rejected handles the driver had just
-created. Validation now goes through `@offsetOf(T, "sentinel")`.
+| Situation | Status | Body |
+|---|---|---|
+| Path matched, verb accepted | `200 OK` | the resource |
+| Path matched, wrong verb | `405 Method Not Allowed` + `Allow` | `method not allowed` |
+| No such path | `404 Not Found` | `not found` |
+| Request line is not a request line | `400 Bad Request` | `bad request` |
+| `HEAD`, any of the above | same status, **zero body bytes** | — |
 
-**`CommandBuffer` is now an `extern struct` with a reserved first slot.** Fixing
-the sentinel alone was not enough: `commands.ptr` also lived at offset 0 and was
-being destroyed by the same loader write. The struct reserves that word
-(`loader_slot`) and keeps no live state in it.
+Verified over raw sockets on the binary this gate builds:
 
-### The loader/ICD handle contract, as measured
+```
+GET    /                      200 OK                  CL=5744    body=5744
+GET    /style.css             200 OK                  CL=12126   body=12126
+GET    /app.js                200 OK                  CL=17926   body=17926
+GET    /api/telemetry         200 OK                  CL=<live>  body=<live>
+GET    /nope                  404 Not Found           CL=10      body=10
+GET    /api/control           405 Allow: POST         CL=19      body=19
+POST   /api/telemetry         405 Allow: GET, HEAD    CL=19      body=19
+PUT    /api/telemetry         405 Allow: GET, HEAD    CL=19      body=19
+DELETE /                      405 Allow: GET, HEAD    CL=19      body=19
 
-Not from the spec — measured on this machine, with the Windows loader at
-`System32/vulkan-1.dll` (1.3.301) and ICD interface version 4:
+blank request line            400 Bad Request         CL=12      body=12
+bare GET, no target           400 Bad Request         CL=12      body=12
+method + space, no target     400 Bad Request         CL=12      body=12
+separators only               400 Bad Request         CL=12      body=12
+tab-separated request line    400 Bad Request         CL=12      body=12
+single LF                     400 Bad Request         CL=12      body=12
+
+HEAD /                        200 OK                  CL=5744    body=0
+HEAD /style.css               200 OK                  CL=12126   body=0
+HEAD /app.js                  200 OK                  CL=17926   body=0
+HEAD /nope                    404 Not Found           CL=10      body=0
+```
+
+Three things worth stating, because each was a real defect:
+
+- **A miss is 404, not 200.** `respond404` used to build its body and delegate to
+  `respond200`, which hardcoded `200 OK`. Verified on a binary from `main`:
+  `GET /nope` answered `200 OK` with the body `not found`.
+- **The verb is part of the route.** Dispatch was on path alone, so `DELETE /`
+  returned the entire dashboard and `GET /api/control` answered `{"ok":true}`
+  having written nothing — an ack for a write never performed.
+- **A malformed request line is 400, not the dashboard.** `extractMethod` and
+  `extractPath` each supplied a default (`"GET"` and `"/"`); a blank line
+  resolved to `GET /` and returned 5744 bytes of HTML with a `200`. A
+  tab-separated line was worse in a different way: it tokenises to one token, that
+  token became the *method*, and the result was a `405` advertising
+  `Allow: GET, HEAD` for a request that was never valid. The method is now
+  validated against RFC 9110 `tchar`, because a token count cannot tell "the
+  client forgot the method" from "the method is an odd word" — `/ HTTP/1.1` has
+  two tokens.
+
+`Content-Length` on a HEAD response is the length GET would have returned, not
+zero. RFC 9110 says the headers SHOULD match; zeroing it would make the framing
+consistent by making the header a lie. The proof that framing is right is not
+the status line but the connection: a second request sent down the same socket
+after `HEAD /` is refused (`ConnectionAbortedError`) because the server sent
+`Connection: close` and closed. No phantom 5744 bytes arrive to be misread as a
+second response.
+
+## The loader/ICD handle contract, as measured
+
+Measured on this machine with the Windows loader at `System32/vulkan-1.dll`
+(1.3.301) and ICD interface version 4 — not from the spec:
 
 - The loader allocates **no** separate wrapper. The address the ICD returns from
   `vkAllocateCommandBuffers` is the address the loader hands back.
 - The loader **writes its dispatch pointer over the first 8 bytes** of that
   object. Anything live in that prefix is destroyed.
-- `CommandPool` survived because its sentinel is 4 bytes and the write landed
-  elsewhere; `CommandBuffer` did not, because its `commands` slice started at 0.
+- `CommandPool` survived because its sentinel is 4 bytes; `CommandBuffer` did not,
+  because its `commands` slice started at offset 0.
 
-### Zig 0.16 does not lay out structs in declaration order
+Four `vkCmd*` entry points had a phantom leading `_: ?*anyopaque`, as if a
+`VkDevice` were passed first. They are registered directly in the dispatch table,
+so the extra slot swallowed the real first argument.
 
-This is the trap that cost the most time. For
-`{sentinel: u32, recording: bool, commands: []Command, count, capacity, err}`,
-`@offsetOf` reports:
+**Zig 0.16 packs struct fields by alignment, not declaration order.** For
+`{sentinel: u32, recording: bool, commands: []Command, count, capacity, err}`:
 
 ```
 sentinel=32  recording=44  commands=0  count=16  capacity=24  size=48
 ```
 
-`commands` is at offset **0** even though `sentinel` is written first — the
-compiler packs by alignment. Any offset derived by reading the source, or by
-assuming C-style ordering, is wrong.
+`commands` is at offset **0** even though `sentinel` is written first. Handle
+validation therefore goes through `@offsetOf(T, "sentinel")`; any literal would
+rot silently.
 
-### Probe progression
+## The benchmark's ratio is measured on both sides
 
-| State | Probe result |
-|---|---|
-| First ever run | `total=44 passed=36 failed=8`, exit 1 — `BAD cmdbuf handle` on every command |
-| After the `@offsetOf` sentinel fix | `passed=41 failed=3`, exit 1 — loader rejected the handle at `vkEndCommandBuffer` |
-| After the four signature fixes | unchanged — `vkCmdWriteBuffer` recorded, same VUID |
-| After reserving the clobbered prefix | `total=45 passed=45 failed=0`, exit 0 |
-| After adding `vkCmdFillBuffer` coverage | **`total=50 passed=50 failed=0`, exit 0** |
+`bench.zig` used to print `67.3 / 0.08`, where the second half was a literal
+nothing had ever measured, and the printed multiplier divided it by its own
+partner. README repeated the result as "roughly 840x worse than RAM".
 
-The third failure only appeared once recording genuinely started working, which
-is why the object had to be made coherent rather than merely readable.
-
-## PR #3: the benchmark's ratio is now measured on both sides
-
-`bench.zig` printed `67.3 / 0.08`. The first half was a real uncached
-random-read latency; the second was a literal that nothing in this project ever
-measured, and the printed multiplier was that literal divided by its own
-partner. README repeated the result as "roughly 840x worse than RAM", making a
-fabricated number the project's headline performance claim.
-
-`measureRam` now measures a counterpart instead of assuming one: a dependent
-pointer chase through a 256 MiB buffer, so every step misses cache and the
-prefetcher has nothing to work with. That is the same quantity the device half
-measures — random access latency — rather than one borrowed from a spec sheet.
+`measureRam` now measures a counterpart: a dependent pointer chase through a
+256 MiB buffer, so every step misses cache. Same quantity the device half
+measures.
 
 ```
 system RAM memcpy             2108 MB/s   (256 MiB, sequential)
@@ -145,205 +164,65 @@ pool random access          2370.1 us     (uncached 4 KiB reads, 8 GiB set)
 => about 4036x
 ```
 
-**The honest ratio is 4036x, not 840x.** The old `0.08` understated RAM
-random-access latency by roughly 7x, so the published gap was wrong in the
-*optimistic* direction by about the same factor — the pool is slower than RAM by
-nearly five times what the README claimed.
+Two caveats the banner states rather than hides: a dependent-load chase and an
+uncached 4 KiB sector read are different operations, so the ratio is a scale and
+not a constant; and the pool figure is the 8 GiB row of a sweep, because the
+smaller rows measure the RAID controller's cache rather than the device.
 
-Two honest caveats the banner states rather than hides:
+## The gate builds what it vouches for
 
-- The halves are not perfectly like for like. A dependent-load pointer chase and
-  an uncached 4 KiB sector read are different operations; the ratio is a useful
-  scale, not a precise constant.
-- The pool figure is the 8 GiB row of a sweep. The smaller rows measure the RAID
-  controller's cache, not the device, which is why the largest row is quoted.
-
-## PR #4: the dashboard was answering 200 OK for a missing route
-
-`serveOnce` dispatched on **path alone**, in an `if/else` chain whose last arm
-was the catch-all. Nothing said what the catch-all should return, and the helper
-it called was:
-
-```zig
-fn respond404(client: c.SOCKET) void {
-    respond200(client, "text/plain", "not found\n");
-}
-
-fn respond200(client: c.SOCKET, mime: []const u8, body: []const u8) void {
-    // ... "HTTP/1.1 200 OK\r\n" ...
-}
-```
-
-`respond404` composed its body and then delegated to a function that hardcoded
-`200 OK`. The body was honest; the status line was not.
-
-**The verb was never read off the request line either**, so a route's verb was
-advisory. `GET /api/control` answered `{"ok":true}` having written nothing — an
-ack for a write it never performed, since `parseParam` reads the body and a GET
-has none.
-
-`route(path, method)` is now a pure function returning a tagged `Route`:
-
-- No handler holds a status, so there is nothing for one to forget.
-- `respond` is the only function that writes a status line, and takes the status
-  as an argument.
-- There is no path through `route` that matches nothing and returns 200, because
-  the final arm *is* the 404 and nothing follows it to fall into.
-
-The same argument applies to *which paths exist*. `route` consulted
-`isAssetPath` while `serveAsset` re-listed the same paths in an `if/else` chain
-that ended in a catch-all `else` serving `style.css` for anything it did not
-match — so adding a path to the router would have shipped a stylesheet under a
-200. Both now read one `ASSETS` table of `{path, mime, body}`:
+`zig build check` compiled four test roots and nothing else. `main.zig` is the
+root of no test module, so a compile error there left the gate reporting
+`10/10 steps succeeded; 88/88 tests passed` and exiting **0** while `zig build`
+failed outright. Measured with one well-formatted line added to `src/main.zig` —
+a call to a function that does not exist, so the formatting check still passes
+and only a real compile can reject it:
 
 ```
-/            text/html; charset=utf-8             5744 bytes  sha256 01ba6e1e
-/index.html  text/html; charset=utf-8             5744 bytes  sha256 01ba6e1e
-/app.js      application/javascript; charset=utf-8 17926 bytes sha256 c55403c1
-/style.css   text/css; charset=utf-8              12126 bytes sha256 0f7f8a3e
+BEFORE   zig build check -> 10/10 steps succeeded, 88/88 tests passed   exit 0
+         zig build       -> use of undeclared identifier                 exit 1
+AFTER    zig build check -> install transitive failure, 1 errors        exit 1
 ```
 
-405 carries a correct `Allow` header, as RFC 9110 requires. HEAD is accepted
-wherever GET is.
+`check_step` now depends on `b.getInstallStep()`, the same dependency `run` uses,
+so the gate and the shipping build cannot drift. A gate that cannot go red on
+the artifact it certifies is decoration.
 
-This is **observable to anything already consuming the server.** A dashboard, a
-health check or a proxy that branches on `200` vs `4xx` will start seeing 404
-and 405 from paths and verbs that previously succeeded — including paths it
-believed existed.
+## How the three branches combined
 
-### Verified over real sockets, before and after
+They were three independent fixes to the same file, all branched from `main`, and
+they did not merge cleanly. Resolving mechanically would have produced a server
+where the route came from one read of the request and the framing from another —
+the precise defect #7 exists to remove. So the conflicts were resolved by making
+the decision a single value:
 
-Built a binary from `main` and one from the branch, ran both the way the project
-starts them, and drove them with raw sockets.
+| Conflict | Sides | Resolution |
+|---|---|---|
+| `Context.md`, 3 blocks | all three rewrote the same sections | discarded all three; rewrote as one document describing the combined system |
+| `server.zig` `serveOnce` | #6 replaced the `path`/`method` locals with `routeRequest(req)`; #7 read `method` to compute framing | `routeRequest` now returns a `Decision{route, framing}` from a single parse, so framing is no longer threaded from a local #6 deleted |
+| `server.zig` `serveAsset` | #6 kept the 2-arg signature; #7 added a `Framing` parameter | kept #7's signature; it is required, so a call site that forgets cannot compile |
 
-```
-BEFORE (main @ bf3dfca)
-GET /nope                    -> 200 OK  Content-Length: 9     not found
-GET /favicon.ico             -> 200 OK  Content-Length: 9     not found
-DELETE /                     -> 200 OK  Content-Length: 5744  <the entire dashboard>
-PUT /api/telemetry           -> 200 OK  Content-Length: 4939  <live telemetry>
-GET /api/control             -> 200 OK  {"ok":true}          <wrote nothing>
-
-AFTER — 17 cases, every Content-Length matching the actual body byte count
-GET    /                      200 OK                   5744/5744
-GET    /index.html            200 OK                   5744/5744
-GET    /style.css             200 OK                   12126/12126
-GET    /app.js                200 OK                   17926/17926
-GET    /api/telemetry         200 OK                   (live)
-GET    /nope                  404 Not Found            10/10
-GET    /favicon.ico           404 Not Found            10/10
-GET    /app.js.map            404 Not Found            10/10
-GET    /API/telemetry         404 Not Found            10/10
-GET    /api/telemetry/        404 Not Found            10/10
-GET    /api/control           405  Allow: POST
-POST   /api/control           200 OK                   {"ok":true}
-POST   /api/telemetry         405  Allow: GET, HEAD
-PUT    /api/telemetry         405  Allow: GET, HEAD
-DELETE /                      405  Allow: GET, HEAD
-HEAD   /                      200 OK                   5744/5744
-BREW   /api/telemetry         405  Allow: GET, HEAD
-```
-
-The write path was re-checked **for its effect, not just its status**:
-`POST power=LOW` moved telemetry to `LOW`, `POST power=MAX&split=0` moved it to
-`MAX` with `split:false`.
-
-### Two known gaps, deliberately not fixed here
-
-1. **`HEAD` sends a body** — fixed since this was written; see below.
-2. **A malformed request line still answers 200.** `extractMethod` and
-   `extractPath` default to `"GET"` and `"/"` when the token is missing, so a
-   blank request line, or a bare `GET` with no path, returns the whole
-   dashboard with 200. That is a malformed request rather than a missing
-   *route*, so it wants a 400.
-
-## HEAD was sending a body, and the writer never knew the method
-
-`respond` sent the body unconditionally and had no knowledge of the request at
-all. The status was decided by the router while the framing was decided by a
-writer that had never seen the method — two places deciding one thing, which is
-precisely the arrangement PR #4 removed from the status code. Measured over a
-socket against a binary built from `main`, HEAD was byte-identical to GET on
-every route:
-
-```
-HEAD /           -> 200 OK  Content-Length=5744   actual body bytes = 5744
-HEAD /style.css  -> 200 OK  Content-Length=12126  actual body bytes = 12126
-HEAD /app.js     -> 200 OK  Content-Length=17926  actual body bytes = 17926
-HEAD /nope       -> 404     Content-Length=10     actual body bytes = 10
-```
-
-Not cosmetic. A client that reads by `Content-Length` consumes 5744 bytes of
-dashboard it never asked for.
-
-`Framing` is computed once in `serveOnce`, from the same `method` the router just
-used, and threaded to `respond`. HEAD is admitted by `accept` exactly where GET
-is and suppressed for exactly the same requests, because both read one variable
-rather than each deciding for itself. After:
-
-```
-HEAD /           -> 200 OK  Content-Length=5744   body bytes = 0
-HEAD /index.html -> 200 OK  Content-Length=5744   body bytes = 0
-HEAD /style.css  -> 200 OK  Content-Length=12126  body bytes = 0
-HEAD /app.js     -> 200 OK  Content-Length=17926  body bytes = 0
-HEAD /nope       -> 404     Content-Length=10     body bytes = 0
-HEAD /app.js.map -> 404     Content-Length=10     body bytes = 0
-```
-
-`Content-Length` is still the length GET would have returned, not zero: RFC 9110
-says a HEAD response's headers SHOULD match what GET would have sent. Zeroing it
-would make the framing consistent by making the header a lie.
-
-### The check that actually matters: what the connection does next
-
-Framing is only correct if the bytes on the wire match the header. Sending a
-second request down the same socket straight after `HEAD /`:
-
-```
-response 1 status       : HTTP/1.1 200 OK
-declared Content-Length : 5744
-body bytes after headers: 0
-second request          : refused at the socket (ConnectionAbortedError)
-```
-
-The server sent `Connection: close` and then closed, so the client is told the
-connection is finished and the socket confirms it. No phantom 5744 bytes arrive
-to be misread as a second response. Before the fix those bytes existed and a
-client trusting `Content-Length` would have consumed them.
-
-### A gate hole this work hit
-
-`zig build check` does **not** build the server binary — the step never compiles
-`main.zig`. A `switch` in `server.zig` that the test root does not reach passed
-`check` at 88/88 and then failed `zig build` with `expected optional type, found
-'[]const u8'`. Making `check_step` depend on the install step would close it.
-The same reasoning applies to test discovery: `zig build test` only finds tests
-in the root module and its relative imports, so `server.zig`'s tests needed
-`backend_test.zig` to pull the file in and `build.zig` to give the test root the
-same `web_assets` import the exe has. Without both, ten tests would have been
-dead code behind a green gate.
+The `Decision` pair is the point. `routeLine` picks the status and `framingFor`
+picks the framing from the same `line`, so the two cannot come from different
+reads. `respond` takes `Framing` as a required parameter, so the compiler rejects
+a handler that forgets to thread it.
 
 ## What comes next
 
-1. **Make `check` build the executable** — the gate currently passes on code
-   that cannot link into a server. Found the hard way on PR #4. (PR #5, open.)
-2. **Return 400 for an unparseable request line.** Known and confirmed reachable
-   from the real surface. (PR #6, open.)
-3. **Multi-segment pool** — the tier resolver sums free space across roots and
+1. **Retire #5, #6 and #7.** They are fully contained in this branch. Closing
+   them is the user's call, not the agent's.
+2. **Multi-segment pool** — the tier resolver sums free space across roots and
    holds `RESERVE_BYTES` per volume (PR #1), but the pool is still a single file
    on a single volume, so nothing is gained on disk yet.
+3. **Split `server.zig`.** It is 769 lines holding Winsock transport, routing,
+   the telemetry document builder and asset serving. The telemetry serializer
+   belongs in its own file; a change to the document shape should not require
+   reading the router.
 4. **Process-level pool locking test** — existing tests prove a *thread* releases
    `Local\DPU.pool.lock`; none proves two *processes* cannot corrupt `pool.vram`.
-5. **Run the benchmark in CI.** Every number above is from one run on one
-   machine. Nothing re-measures it, so the next edit can quietly make it stale
-   the way the hardcoded `0.08` did — as the probe count already did once.
-6. **Reconcile the three open HTTP branches before merging any of them.** PR #5,
-   #6 and this one each edit `serveOnce` and `Context.md` independently. The
-   framing threads through the same call sites PR #6 rewrites, so the union is
-   not purely a `Context.md` merge.
-
-Resolved since this list was first written: the hardcoded `0.08` ratio (PR #3),
-and no body on a HEAD response.
+5. **Run the benchmark in CI.** Every number above is from one run on one machine.
+   Nothing re-measures it, so the next edit can quietly make it stale the way the
+   hardcoded `0.08` did — as the probe count already did once.
 
 ## Running things
 
@@ -358,18 +237,16 @@ TMPD=$(mktemp -d)
 /a/toolchain/zig/zig.exe build bench --cache-dir "$TMPD/l" --global-cache-dir "$TMPD/g" --summary all
 ```
 
-`zig build probe` sets `VK_ADD_DRIVER_FILES` itself and runs the probe. Nothing
-is installed system-wide, so there is nothing to clean up. To run the binary
-directly, point `VK_ADD_DRIVER_FILES` at `zig-out/bin/vk_icd.json`. The probe
-exits non-zero if any check fails and prints one
-`PROBE_SUMMARY: total=.. passed=.. failed=..` line last, so a failing run reports
-everything rather than stopping at the first failure.
+`zig build check` writes `zig-out/bin/dpu.exe`; that is deliberate, and it means
+the gate is no longer a pure verification step. To run the binary directly,
+point `VK_ADD_DRIVER_FILES` at `zig-out/bin/vk_icd.json`. The probe exits
+non-zero if any check fails and prints one
+`PROBE_SUMMARY: total=.. passed=.. failed=..` line last.
 
 The engine binds `127.0.0.1:8787` and serves **one connection at a time**, so
 issue requests sequentially or they will queue behind each other. `P:\` is
-optional: `Pool.init` failure degrades telemetry to `"buffer":null` and the
-server still starts.
+optional: `Pool.init` failure degrades telemetry to `"buffer":null` and the server
+still starts.
 
-`zig build bench` **destroys `P:\DPU\pool.vram`** — it sweeps an 8 GiB working
-set through it and unlinks the file afterwards. The engine recreates it on next
-start, but expect to recreate it before running the engine again.
+`zig build bench` **destroys `P:\DPU\pool.vram`** — it sweeps an 8 GiB working set
+through it and unlinks the file afterwards. The engine recreates it on next start.
