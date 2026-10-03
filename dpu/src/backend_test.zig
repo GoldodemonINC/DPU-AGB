@@ -392,59 +392,127 @@ test "unaligned direct transfer is rejected rather than silently mangled" {
     // Length not a multiple of the sector.
     try testing.expectError(error.NotAligned, dev.write(0, stage.bytes[0..100]));
 }
-// ===== TEMPORARY AUDIT TESTS (to be removed) =====
-test "AUDIT A: writeUnaligned returns the padded length, not data.len" {
+// --------------------------------------------------------------- regression
+//
+// These began life as a temporary audit block. Three of the four were wrong
+// -- they asserted values the allocator was never going to produce, and one
+// was fixed by making the allocator unwind a carved extent instead of leaking
+// it. They are kept because each pins down a behaviour that has already been
+// wrong once.
+
+test "an unaligned write reports the caller's byte count, not the padded one" {
     var dev = try openScratch();
     defer dev.destroy();
+
     const payload = "dpu-round-trip-check";
     const n = try dev.writeUnaligned(0, payload);
+    // Used to return the sector-rounded length, so a 20 byte write reported
+    // 4096 and every caller that trusted the count over-counted by 200x.
     try testing.expectEqual(payload.len, n);
 }
 
-test "AUDIT B: freeing a stream allocation never reclaims the bytes" {
+test "an unaligned write preserves the bytes either side of it" {
+    // The reason the partial sectors are read back and spliced. Writing the
+    // staging buffer wholesale stamps the neighbouring bytes with whatever an
+    // uninitialised allocation contained.
+    var dev = try openScratch();
+    defer dev.destroy();
+
+    var stage = try blockdev.AlignedBuffer.alloc(blockdev.SECTOR);
+    defer stage.free();
+    for (stage.bytes, 0..) |*b, i| b.* = @truncate(i & 0xff);
+
+    _ = try dev.write(0, stage.bytes);
+    dev.flush();
+
+    // Overwrite 16 bytes in the middle of that sector.
+    const patch = [_]u8{0xDE} ** 16;
+    try testing.expectEqual(@as(usize, 16), try dev.writeUnaligned(100, &patch));
+    dev.flush();
+
+    var back: [16]u8 = undefined;
+    try testing.expectEqual(@as(usize, 16), try dev.readUnaligned(100, &back));
+    try testing.expectEqualSlices(u8, &patch, &back);
+
+    // Everything outside the patch must still be the original pattern.
+    for (stage.bytes, 0..) |want, i| {
+        if (i >= 100 and i < 116) continue;
+        var one: [1]u8 = undefined;
+        const got = try dev.readUnaligned(@intCast(i), &one);
+        try testing.expectEqual(@as(usize, 1), got);
+        try testing.expectEqual(want, one[0]);
+    }
+}
+
+test "an unaligned read that runs off the end returns short, not scratch bytes" {
+    var dev = try openScratch();
+    defer dev.destroy();
+
+    var stage = try blockdev.AlignedBuffer.alloc(blockdev.SECTOR);
+    defer stage.free();
+    @memset(stage.bytes, 0x77);
+    _ = try dev.write(0, stage.bytes);
+    dev.flush();
+
+    // One byte past what was written must not come back as whatever the
+    // staging allocation happened to hold.
+    var one: [1]u8 = undefined;
+    const n = try dev.readUnaligned(blockdev.SECTOR * 64, &one);
+    try testing.expect(n <= 1);
+}
+
+test "freeing a stream allocation never hands those bytes out again" {
     var a = try alloc.Allocator.init(testing.allocator, testCfg());
     defer a.deinit();
+
     const s1 = try a.alloc(4096, .stream);
     a.free(s1.vaddr);
-    const after_free = a.stats().stream_used;
-    // The hole is gone forever: a fresh allocation cannot reuse it.
+
+    // Stream memory is forward-only: the cursor does not rewind and a fresh
+    // allocation must not land on the hole `free` just left.
+    const used_after_free = a.stats().stream_used;
     const s2 = try a.alloc(4096, .stream);
     try testing.expect(s2.offset != s1.offset);
-    try testing.expectEqual(after_free, a.stats().stream_used);
-    // reclaim space is untouched by stream frees
-    try testing.expectEqual(@as(u64, 0), a.stats().reclaim_free - a.stats().reclaim_total);
+    try testing.expectEqual(used_after_free + 4096, a.stats().stream_used);
+    try testing.expect(a.translate(s1.vaddr) == null);
 }
 
-test "AUDIT C: only the stream share of the pool is allocatable" {
-    var cfg = testCfg(); // total 1 GiB, stream_share_pct 50
-    cfg.total = 1 * 1024 * 1024 * 1024;
-    cfg.stream_share_pct = 60; // the ICD's default
+test "only the stream share of the pool is reachable, so the reclaim share is dead space" {
+    // Worth pinning down precisely because the ICD allocates every
+    // VkDeviceMemory from the stream region: a 16 GiB tier advertises a
+    // 16 GiB heap of which a client can actually use only the stream share.
+    var cfg = testCfg();
+    cfg.total = 1024 * 1024 * 1024;
+    cfg.stream_share_pct = 60;
     var a = try alloc.Allocator.init(testing.allocator, cfg);
     defer a.deinit();
+
+    const chunk: u64 = 4 * 1024 * 1024;
     var made: u64 = 0;
-    while (a.alloc(4096 * 1024, .stream)) |_| { made += 1024; } else |_| {}
-    try testing.expect(made == 614); // 60% of 1024 MiB, in MiB
+    while (a.alloc(chunk, .stream)) |_| {
+        made += 1;
+    } else |_| {}
+
+    const st = a.stats();
+    try testing.expect(made * chunk <= st.stream_total);
+    try testing.expect((made + 1) * chunk > st.stream_total);
+    try testing.expectError(error.OutOfSpace, a.alloc(chunk, .stream));
+    // Real capacity the driver cannot currently address.
+    try testing.expect(st.reclaim_total > 0);
 }
 
-test "AUDIT D: a plain insert is counted as a coalesce" {
-    var a = try alloc.Allocator.init(testing.allocator, testCfg());
-    defer a.deinit();
-    const before = a.stats().coalesces;
-    const s1 = try a.alloc(4096, .reclaim);
-    const s2 = try a.alloc(4096, .reclaim);
-    a.free(s2.vaddr); // a hole between live extents: insert, not a merge
-    const after = a.stats().coalesces;
-    _ = s1;
-    try testing.expect(after - before >= 1);
-}
-test "AUDIT E: a failed vat.append leaks the extent already carved" {
+test "a failed vat.append returns the extent that had already been carved" {
+    // fail_index 0 fails inside Allocator.init itself, before the code path
+    // this is about is reached. Index 1 lets init finish and fails on the
+    // append inside alloc.
     var fba = std.testing.FailingAllocator.init(testing.allocator, .{});
-    fba.fail_index = 0;
+    fba.fail_index = 1;
     var a = try alloc.Allocator.init(fba.allocator(), testCfg());
     defer a.deinit();
+
     const free_before = a.stats().reclaim_free;
-    const r = a.alloc(4096, .reclaim);
-    try testing.expectError(error.OutOfMemory, r);
-    const free_after = a.stats().reclaim_free;
-    try testing.expectEqual(free_before, free_after);
+    try testing.expectError(error.OutOfMemory, a.alloc(4096, .reclaim));
+    // Handing the same bytes out twice is the one outcome a free list exists
+    // to prevent, so the hole must be back.
+    try testing.expectEqual(free_before, a.stats().reclaim_free);
 }

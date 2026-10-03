@@ -171,6 +171,18 @@ pub const Allocator = struct {
             .reclaim => try self.allocReclaim(need),
         };
 
+        // From here the region is carved out of the pool. Every fallible step
+        // below has to hand it back, because the failure mode of getting this
+        // wrong is that the same bytes are later handed out twice -- two live
+        // allocations overlapping, with nothing to detect it.
+        errdefer switch (kind) {
+            .stream => self.stream_cursor -= need,
+            .reclaim => {
+                self.reclaim_used -= need;
+                self.releaseExtent(offset, need);
+            },
+        };
+
         const vaddr = self.next_vaddr;
         // Wrapping would silently alias two live allocations onto one address.
         if (self.next_vaddr + 1 == 0) return Error.OutOfSpace;
@@ -266,8 +278,11 @@ pub const Allocator = struct {
         }
         if (!merged_back) {
             self.free_list.insert(i, .{ .offset = offset, .len = len }) catch {
-                // Losing a hole would hand the same bytes out twice. Panic is
-                // the only safe response; the pool is already failing.
+                // Losing a hole would hand the same bytes out twice, so the
+                // unwind path in `alloc` is the only thing that may run here.
+                // Reaching this means a caller released an extent that never
+                // came from the free list, which is a bug rather than a
+                // condition to survive.
                 @panic("dpu alloc: free list insert failed");
             };
             self.coalesces += 1;

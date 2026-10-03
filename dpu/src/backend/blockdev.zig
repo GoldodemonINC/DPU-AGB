@@ -331,39 +331,108 @@ pub const BlockDevice = struct {
     /// Write from an arbitrary buffer, bouncing through an aligned staging
     /// buffer when necessary.
     ///
-    /// Only the tail needs staging in practice: the prefix can be written
-    /// directly once its length is rounded down to a sector multiple.
+    /// Returns the caller's own byte count, never the sector-rounded one. The
+    /// old version returned whatever `write` reported for the padded transfer,
+    /// so a 20 byte write came back as 4096 and every caller that trusted the
+    /// number over-counted by three orders of magnitude.
+    ///
+    /// The partial sectors at each end are read back, spliced and rewritten
+    /// rather than written wholesale. Writing the staging buffer as-is is the
+    /// obvious implementation and it is wrong twice over: it stamps the bytes
+    /// on either side of the caller's range with whatever an uninitialised
+    /// `VirtualAlloc` happened to contain, and it silently discards the
+    /// neighbour that lived there.
     pub fn writeUnaligned(self: *BlockDevice, offset: u64, data: []const u8) !usize {
         if (data.len == 0) return 0;
-        if (isAlignedPtr(data.ptr) and data.len % SECTOR == 0 and offset % SECTOR == 0) {
-            return self.write(offset, data);
+
+        if (offset % SECTOR == 0 and data.len % SECTOR == 0 and isAlignedPtr(data.ptr)) {
+            _ = try self.write(offset, data);
+            return data.len;
         }
 
-        var stage = try AlignedBuffer.alloc(data.len);
+        var stage = try AlignedBuffer.alloc(@intCast(SECTOR));
         defer stage.free();
-        @memcpy(stage.bytes[0..data.len], data);
-        return self.write(roundDown(offset), stage.bytes[0..roundUp(data.len)]);
+        const sect = stage.bytes[0..@intCast(SECTOR)];
+        var done: usize = 0;
+
+        // Head: a partial first sector, merged into whatever is already there.
+        const head: usize = @intCast(offset % SECTOR);
+        if (head != 0) {
+            const chunk = @min(@as(usize, SECTOR), data.len);
+            // A sector that has never been written is holes on NTFS and reads
+            // back as zeroes, but a read past the current end of the file
+            // simply fails. Both mean the same thing here -- there is nothing
+            // to preserve -- so both leave the scratch zeroed.
+            _ = self.read(roundDown(offset), sect) catch @memset(sect, 0);
+            @memcpy(sect[head..][0..chunk], data[0..chunk]);
+            _ = try self.write(roundDown(offset), sect);
+            done = chunk;
+        }
+
+        // Middle: whole sectors straight from the caller's buffer.
+        while (done + SECTOR <= data.len and (offset + done) % SECTOR == 0) {
+            const chunk: usize = @intCast(SECTOR);
+            const src = data[done..][0..chunk];
+            if (isAlignedPtr(src.ptr)) {
+                _ = try self.write(offset + done, src);
+            } else {
+                @memcpy(sect, src);
+                _ = try self.write(offset + done, sect);
+            }
+            done += chunk;
+        }
+
+        // Tail: a partial final sector, same treatment as the head.
+        if (done < data.len) {
+            const at = offset + done;
+            const base = roundDown(at);
+            const inside: usize = @intCast(at - base);
+            const chunk = data.len - done;
+            _ = self.read(base, sect) catch @memset(sect, 0);
+            @memcpy(sect[inside..][0..chunk], data[done..][0..chunk]);
+            _ = try self.write(base, sect);
+            done += chunk;
+        }
+
+        return done;
     }
 
     /// Read into an arbitrary buffer, bouncing through an aligned staging
     /// buffer when necessary.
+    ///
+    /// A short read at end of file stops the loop and reports the short count.
+    /// It does not copy whatever the staging buffer held past that point: the
+    /// old version discarded the byte count from `read` and copied the full
+    /// requested length out of uninitialised scratch, so a read that ran off
+    /// the end of the pool handed the caller uninitialised memory.
     pub fn readUnaligned(self: *BlockDevice, offset: u64, buf: []u8) !usize {
         if (buf.len == 0) return 0;
-        if (isAlignedPtr(buf.ptr) and buf.len % SECTOR == 0 and offset % SECTOR == 0) {
-            return self.read(offset, buf);
+
+        if (offset % SECTOR == 0 and buf.len % SECTOR == 0 and isAlignedPtr(buf.ptr)) {
+            _ = try self.read(offset, buf);
+            return buf.len;
         }
 
-        var stage = try AlignedBuffer.alloc(buf.len);
+        var stage = try AlignedBuffer.alloc(@intCast(SECTOR));
         defer stage.free();
-        const want = roundUp(buf.len);
-        _ = try self.read(roundDown(offset), stage.bytes[0..want]);
+        const sect = stage.bytes[0..@intCast(SECTOR)];
+        var done: usize = 0;
 
-        // Holes read as zeroes, but a short read at EOF is not the same thing.
-        const base = offset - roundDown(offset);
-        const available = want - base;
-        const n = @min(available, buf.len);
-        @memcpy(buf[0..n], stage.bytes[base .. base + n]);
-        return n;
+        while (done < buf.len) {
+            const at = offset + done;
+            const base = roundDown(at);
+            const inside: usize = @intCast(at - base);
+            const want = @min(@as(usize, SECTOR) - inside, buf.len - done);
+            // A read that fails is a read that ran off the end of the file.
+            // Stop and report the short count rather than copying whatever the
+            // scratch allocation held.
+            const got = self.read(base, sect) catch break;
+            if (got < inside + want) break;
+            @memcpy(buf[done..][0..want], sect[inside..][0..want]);
+            done += want;
+        }
+
+        return done;
     }
 
     /// Push buffered writes to the device.
@@ -594,9 +663,13 @@ fn markSparseViaFsutil(allocator: std.mem.Allocator, path: [:0]const u16) bool {
     const cmd = std.fmt.bufPrint(&cmd_buf, "fsutil sparse setflag \"{s}\"", .{path_u8}) catch return false;
     if (!runAndWait(cmd)) return false;
 
-    var attr: c.DWORD = 0;
+    // The output of GetFileAttributesExW is a WIN32_FILE_ATTRIBUTE_DATA --
+    // five fields, 88 bytes on x86-64 -- not the DWORD the old code passed. A
+    // four byte stack buffer meant every pool open in both processes wrote
+    // roughly eighty bytes past the end of it.
+    var attr: c.WIN32_FILE_ATTRIBUTE_DATA = undefined;
     if (c.GetFileAttributesExW(path, c.GetFileExInfoStandard, @ptrCast(&attr)) == 0) return false;
-    return @as(u32, attr) & @as(c_uint, c.FILE_ATTRIBUTE_SPARSE_FILE) != 0;
+    return @as(u32, attr.dwFileAttributes) & @as(c_uint, c.FILE_ATTRIBUTE_SPARSE_FILE) != 0;
 }
 
 fn runAndWait(cmd: []const u8) bool {
