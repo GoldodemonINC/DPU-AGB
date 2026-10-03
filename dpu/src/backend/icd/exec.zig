@@ -92,12 +92,30 @@ const Command = struct {
     fill_data: u32 = 0,
 };
 
-const CommandBuffer = struct {
+/// `extern` so the field order below is the memory layout.
+///
+/// A plain Zig struct does not lay out in declaration order -- the compiler
+/// packs fields by alignment, and it puts this one at sentinel=32,
+/// commands=0, count=16, capacity=24, size=48 regardless of how it is
+/// written. That matters because the loader writes its own dispatch pointer
+/// over the first word of a dispatchable object, and with `commands` at
+/// offset 0 that write destroyed the command ring pointer: recording appeared
+/// to work and then the object could no longer resolve, which surfaced as the
+/// loader rejecting the handle at vkEndCommandBuffer. `extern` keeps
+/// declaration order, so the reserved slot below is genuinely at offset 0.
+const CommandBuffer = extern struct {
+    /// Clobbered by the loader's dispatch pointer. Deliberately carries no
+    /// live state -- this slot exists to keep everything else out of the
+    /// prefix the loader owns.
+    loader_slot: ?*anyopaque = null,
+    /// A slice is not permitted in an `extern struct`, so the ring is carried
+    /// as the pointer and length it lowers to anyway.
+    commands_ptr: ?[*]Command = null,
+    commands_len: usize = 0,
+    count: usize = 0,
+    capacity: usize = 0,
     sentinel: u32 = 0x44505507,
     recording: bool = false,
-    commands: []Command,
-    count: usize,
-    capacity: usize,
     /// First failure seen while recording.
     ///
     /// Every `vkCmd*` entry point returns void, so a command that could not be
@@ -105,7 +123,10 @@ const CommandBuffer = struct {
     /// full command ring turns into a submit that returns VK_SUCCESS having
     /// written nothing at all, so the status is latched here and surfaced by
     /// the next `vkQueueSubmit` instead of being discarded.
-    err: ?c_int = null,
+    /// `VK_SUCCESS` is 0 and every Vulkan error code is negative, so zero means
+    /// "nothing went wrong" without needing an optional -- and `extern struct`
+    /// does not permit one.
+    err: c_int = 0,
 };
 
 const Fence = struct {
@@ -129,12 +150,26 @@ const CommandPool = struct {
     family: u32 = 0,
 };
 
+/// Check a dispatchable object's sentinel without assuming where it lives.
+///
+/// The loader writes its own dispatch pointer over the first word of the
+/// object it wraps, so anything the ICD keeps in that prefix is not
+/// trustworthy -- and in `CommandBuffer` the first word is `commands.ptr`, so
+/// validating there rejected handles this driver had just allocated. The
+/// offset is taken through `@offsetOf` rather than written as a literal so it
+/// cannot drift from the struct: a field reorder moves both together, and a
+/// stale hardcoded 32 would silently start reading whatever is at offset 32.
+fn hasSentinel(comptime T: type, h: *anyopaque, magic: u32) bool {
+    if (@intFromPtr(h) % @alignOf(T) != 0) return false;
+    const off = @offsetOf(T, "sentinel");
+    const word = @as(*align(1) const u32, @ptrCast(@as([*]u8, @ptrFromInt(@intFromPtr(h) + off))[0..4]));
+    return word.* == magic;
+}
+
 fn asCommandPool(handle: ?*anyopaque) ?*CommandPool {
     const h = handle orelse return null;
-    if (@intFromPtr(h) % @alignOf(CommandPool) != 0 or
-        @as(*align(1) const u32, @ptrCast(h)).* != 0x44505509)
-    {
-        std.debug.print("[dpu] BAD pool handle 0x{x} first_u32=0x{x}\n", .{ @intFromPtr(h), @as(*align(1) const u32, @ptrCast(h)).* });
+    if (!hasSentinel(CommandPool, h, 0x44505509)) {
+        std.debug.print("[dpu] BAD pool handle 0x{x}\n", .{@intFromPtr(h)});
         return null;
     }
     return @ptrCast(@alignCast(h));
@@ -503,7 +538,8 @@ pub fn vkAllocateCommandBuffersImpl(
         const cb: *CommandBuffer = @ptrCast(@alignCast(slot));
         const window = takeCommandWindow() orelse return c.VK_ERROR_OUT_OF_HOST_MEMORY;
         cb.* = .{
-            .commands = window,
+            .commands_ptr = window.ptr,
+            .commands_len = window.len,
             .count = 0,
             .capacity = window.len,
         };
@@ -514,10 +550,8 @@ pub fn vkAllocateCommandBuffersImpl(
 
 fn asCommandBuffer(handle: ?*anyopaque) ?*CommandBuffer {
     const h = handle orelse return null;
-    if (@intFromPtr(h) % @alignOf(CommandBuffer) != 0 or
-        @as(*align(1) const u32, @ptrCast(h)).* != 0x44505507)
-    {
-        std.debug.print("[dpu] BAD cmdbuf handle 0x{x} first_u32=0x{x}\n", .{ @intFromPtr(h), @as(*align(1) const u32, @ptrCast(h)).* });
+    if (!hasSentinel(CommandBuffer, h, 0x44505507)) {
+        std.debug.print("[dpu] BAD cmdbuf handle 0x{x}\n", .{@intFromPtr(h)});
         return null;
     }
     return @ptrCast(@alignCast(h));
@@ -554,7 +588,7 @@ pub fn vkEndCommandBufferImpl(handle: ?*anyopaque) callconv(.c) c_int {
     // The client gets to know its work was dropped while there is still
     // something it can do about it, instead of after a submit reported
     // success having written nothing.
-    return cb.err orelse c.VK_SUCCESS;
+    return cb.err;
 }
 
 pub fn vkResetCommandBufferImpl(
@@ -569,7 +603,7 @@ pub fn vkResetCommandBufferImpl(
     // again without one is reusing a command buffer the spec says it must not
     // reuse, and quietly clearing here would hide exactly the mistake this
     // latch exists to surface.
-    cb.err = null;
+    cb.err = c.VK_SUCCESS;
     return c.VK_SUCCESS;
 }
 
@@ -577,7 +611,7 @@ fn record(cb: ?*CommandBuffer, cmd: Command) c_int {
     const buf = cb orelse return c.VK_ERROR_INITIALIZATION_FAILED;
     if (!buf.recording) return c.VK_ERROR_INITIALIZATION_FAILED;
     if (buf.count >= buf.capacity) return c.VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    buf.commands[buf.count] = cmd;
+    buf.commands_ptr.?[buf.count] = cmd;
     buf.count += 1;
     return c.VK_SUCCESS;
 }
@@ -591,11 +625,10 @@ fn record(cb: ?*CommandBuffer, cmd: Command) c_int {
 /// comes back out of `vkEndCommandBuffer` and `vkQueueSubmit`.
 fn recordOrLatch(cb: *CommandBuffer, cmd: Command) void {
     const rc = record(cb, cmd);
-    if (rc != c.VK_SUCCESS and cb.err == null) cb.err = rc;
+    if (rc != c.VK_SUCCESS and cb.err == c.VK_SUCCESS) cb.err = rc;
 }
 
 pub fn vkCmdCopyBufferImpl(
-    _: ?*anyopaque,
     handle: ?*anyopaque,
     src: ?*anyopaque,
     dst: ?*anyopaque,
@@ -619,7 +652,6 @@ pub fn vkCmdCopyBufferImpl(
 }
 
 pub fn vkCmdWriteBufferImpl(
-    _: ?*anyopaque,
     handle: ?*anyopaque,
     dst: ?*anyopaque,
     offset: u64,
@@ -646,7 +678,6 @@ pub fn vkCmdWriteBufferImpl(
 }
 
 pub fn vkCmdFillBufferImpl(
-    _: ?*anyopaque,
     handle: ?*anyopaque,
     dst: ?*anyopaque,
     offset: u64,
@@ -665,7 +696,6 @@ pub fn vkCmdFillBufferImpl(
 }
 
 pub fn vkCmdPipelineBarrierImpl(
-    _: ?*anyopaque,
     _: ?*anyopaque,
     _: c.VkPipelineStageFlags,
     _: c.VkPipelineStageFlags,
@@ -708,7 +738,9 @@ pub fn vkCreateFenceImpl(
 }
 
 fn asFence(handle: ?*anyopaque) ?*Fence {
-    const f: *Fence = @ptrCast(@alignCast(handle orelse return null));
+    const h = handle orelse return null;
+    if (!hasSentinel(Fence, h, 0x44505508)) return null;
+    const f: *Fence = @ptrCast(@alignCast(h));
     if (f.sentinel != 0x44505508) return null;
     return f;
 }
@@ -791,8 +823,8 @@ pub fn vkQueueSubmitImpl(
             };
             // A command that failed to record never reached the disk. Surface
             // it rather than submitting the truncated remainder as a success.
-            if (cb.err) |e| status = worstStatus(status, e);
-            for (cb.commands[0..cb.count]) |cmd| {
+            if (cb.err != c.VK_SUCCESS) status = worstStatus(status, cb.err);
+            for (cb.commands_ptr.?[0..cb.count]) |cmd| {
                 execute(cmd) catch |err| {
                     status = worstStatus(status, submitStatus(err));
                 };

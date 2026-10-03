@@ -528,6 +528,40 @@ pub fn main() !void {
     }
     check(round_trip_bad == 0, "device -> staging round trip is byte-identical ({d} mismatches)", .{round_trip_bad});
 
+    // vkCmdFillBuffer carries no host pointer: the value is a u32 the driver
+    // writes itself. That makes it a different recording path from
+    // vkCmdWriteBuffer (which dereferences client memory) and
+    // vkCmdCopyBuffer (which moves between two buffers), and it was the one
+    // command entry point whose parameter list had been wrong with nothing in
+    // this probe able to notice -- a shifted signature here silently fills
+    // nothing and still reports success. Recorded, submitted and read back
+    // rather than assumed.
+    const FILL: u32 = 0xDEADBEEF;
+    const pfn_fill: *const fn (c.VkCommandBuffer, c.VkBuffer, u64, u64, u32) callconv(.c) void =
+        @ptrCast(@alignCast(devProc("vkCmdFillBuffer", device, dpu_dev) orelse return finish()));
+
+    check(pfn_begin(cmd, &cbbi) == 0, "vkBeginCommandBuffer (fill)", .{});
+    pfn_fill(cmd, dev_buf, 0, PAYLOAD, FILL);
+    _ = pfn_end(cmd);
+    check(pfn_submit(queue, 1, &si, fence) == 0, "vkQueueSubmit (fill) -> success", .{});
+    _ = pfn_wait(device, @ptrCast(&fence), 0, 10_000_000_000);
+
+    // Read it back through the driver rather than trusting the submit status,
+    // which is the whole lesson of this file: a path that writes nothing still
+    // returns VK_SUCCESS.
+    check(pfn_begin(cmd, &cbbi) == 0, "vkBeginCommandBuffer (fill readback)", .{});
+    pfn_copy(cmd, dev_buf, vbuf, &region, 1);
+    _ = pfn_end(cmd);
+    check(pfn_submit(queue, 1, &si, fence) == 0, "vkQueueSubmit (fill readback) -> success", .{});
+    _ = pfn_wait(device, @ptrCast(&fence), 0, 10_000_000_000);
+
+    var fill_bad: usize = 0;
+    for (0..check_bytes / 4) |k| {
+        const have = std.mem.readInt(u32, (staging orelse return finish())[k * 4 ..][0..4], .little);
+        if (have != FILL) fill_bad += 1;
+    }
+    check(fill_bad == 0, "vkCmdFillBuffer round trip is byte-identical ({d} mismatches)", .{fill_bad});
+
     // --------------------------------------------- 8. refusal is clean
     std.debug.print("\n8. an impossible allocation is refused cleanly\n", .{});
     var huge: c.VkMemoryAllocateInfo = .{
