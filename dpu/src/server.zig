@@ -127,7 +127,8 @@ pub const Server = struct {
 
     fn sendResponse(client: c.SOCKET, status: []const u8, mime: []const u8, body: []const u8) void {
         var head: [512]u8 = undefined;
-        const header = std.fmt.bufPrint(&head,
+        const header = std.fmt.bufPrint(
+            &head,
             "HTTP/1.1 {s}\r\n" ++
                 "Content-Type: {s}\r\n" ++
                 "Content-Length: {d}\r\n" ++
@@ -322,14 +323,12 @@ fn parseParam(req: []const u8, key: []const u8) ?[]const u8 {
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
         if (!std.mem.eql(u8, pair[0..eq], key)) continue;
         var v = pair[eq + 1 ..];
-        if (v.len > 0 and v[0] == '"') v = v[1 ..];
+        if (v.len > 0 and v[0] == '"') v = v[1..];
         if (v.len > 0 and v[v.len - 1] == '"') v = v[0 .. v.len - 1];
         return v;
     }
     return null;
 }
-
-
 
 // Static assets are embedded at compile time. The dashboard then ships inside
 // the binary: no asset directory to lose, no runtime file I/O, no 404s.
@@ -352,7 +351,8 @@ fn serveStatic(client: c.SOCKET, path: []const u8) void {
 
 fn respond200(client: c.SOCKET, body: []const u8, mime: []const u8) void {
     var head: [256]u8 = undefined;
-    const header = std.fmt.bufPrint(&head,
+    const header = std.fmt.bufPrint(
+        &head,
         "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n" ++
             "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
         .{ mime, body.len },

@@ -130,7 +130,6 @@ pub fn tierAtOrBelow(bytes: u64) u64 {
 /// and no ordering to get wrong.
 pub const state_filename = "tier.cfg";
 
-
 /// Serialise the granted tier. Written best-effort; a failure here must not
 /// take the engine down, because the fallback is a conservative default.
 pub fn formatState(buf: []u8, granted: u64, free_at_check: u64) ![]const u8 {

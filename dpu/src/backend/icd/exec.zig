@@ -217,7 +217,6 @@ fn bounce(n: usize) []u8 {
 }
 
 /// ------------------------------------------------------------- vkAllocateMemory
-
 /// `VK_ERROR_OUT_OF_DEVICE_MEMORY` for every allocation failure.
 ///
 /// Not `VK_ERROR_FRAGMENTED_POOL` or a silent success with a short allocation:
@@ -690,8 +689,7 @@ pub fn vkQueueBindSparseImpl(
     _: u32,
     _: ?*const c.VkBindSparseInfo,
     _: ?*anyopaque,
-) callconv(.c) void {
-}
+) callconv(.c) void {}
 
 // -------------------------------------------------------------------- fences
 
@@ -949,8 +947,6 @@ pub fn planFill(d: *const Buffer, dst_offset: u64, size: u64) PlanError!Plan {
         .needs_bounce = false,
     };
 }
-
-
 
 // ------------------------------------------------------------- execution
 
@@ -1360,7 +1356,7 @@ test "bounce memory is sector aligned and bounded" {
 
 test "no transfer failure is reported to the client as success" {
     const every = [_]PlanError{
-        error.OutOfPool,   error.ShortTransfer, error.PoolUnavailable,
+        error.OutOfPool,     error.ShortTransfer, error.PoolUnavailable,
         error.UnboundBuffer, error.OutOfBounds,
     };
     for (every) |err| {

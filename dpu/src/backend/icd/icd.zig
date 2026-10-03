@@ -108,11 +108,9 @@ const POOL_DIR: []const u8 = "P:\\DPU";
 /// `vulkaninfo` creates and destroys devices, buffers, fences and command
 /// buffers many times per run, and a general allocator inside a graphics driver
 /// is a well-known source of teardown crashes.
-
 /// Device handed out most recently, so `vkGetDeviceQueue` can recover the
 /// queues from a bare handle. Single-threaded by design; see above.
 var last_device: ?*Device = null;
-
 
 // ----------------------------------------------------------- device claims
 
@@ -189,7 +187,7 @@ export fn vk_icdGetInstanceProcAddr(instance: ?*anyopaque, pName: ?[*:0]const u8
     const name = std.mem.span(pName.?);
 
     const entry = entryLookup(name) orelse return null;
-    return @constCast(@ptrCast(entry));
+    return @ptrCast(@constCast(entry));
 }
 
 const Pfn = *const fn () callconv(.c) void;
@@ -290,7 +288,7 @@ export fn vk_icdGetPhysicalDeviceProcAddr(_: ?*anyopaque, pName: ?[*:0]const u8)
     if (pName == null) return null;
     const name = std.mem.span(pName.?);
     const entry = entryLookup(name) orelse return null;
-    return @constCast(@ptrCast(entry));
+    return @ptrCast(@constCast(entry));
 }
 
 // --------------------------------------------------------------- instance
@@ -783,7 +781,7 @@ fn vkDestroyDeviceImpl(handle: ?*anyopaque, _: ?*const c.VkAllocationCallbacks) 
 fn vkGetDeviceProcAddrImpl(_: ?*anyopaque, pName: ?[*:0]const u8) callconv(.c) ?*anyopaque {
     if (pName == null) return null;
     const entry = entryLookup(std.mem.span(pName.?)) orelse return null;
-    return @constCast(@ptrCast(entry));
+    return @ptrCast(@constCast(entry));
 }
 
 fn vkGetDeviceQueueImpl(

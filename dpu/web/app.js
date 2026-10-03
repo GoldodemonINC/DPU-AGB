@@ -21,7 +21,8 @@ const TRACES = [
 const state = {
   traces: {},          // key -> number[] ring buffer
   nodes: [],
-  power: "xhigh",
+  power: "xHIGH",   // matches PowerMode.label() on the server, so the granted
+                    // tier maps back to the button that selected it
   split: true,
   engine: {},
   tickerItems: [],
@@ -136,7 +137,7 @@ function renderReadouts(d, gpuShared) {
 
   $("ro-uptime").textContent = fmtUptime(d.uptimeMs || 0);
   $("ro-agents").textContent = (d.total && d.total.agents) || 0;
-  $("ro-mode").textContent = d.engine.power || "xHIGH";
+  $("ro-mode").textContent = d.engine.power || "--";
   $("clock").textContent = fmtClock(Date.now());
   $("sample-rate").textContent = `${POLL_MS}ms · PDH`;
 
@@ -242,7 +243,9 @@ function wireControls() {
     const btn = e.target.closest(".ctl-btn");
     if (!btn) return;
     sendControl({ power: btn.dataset.power });
-    setTicker(`power mode -> ${btn.dataset.power.toUpperCase()}`, "new");
+    // The button's name is the server's spelling, so the ticker agrees with
+    // the label /api/telemetry reports back rather than shouting it upper-case.
+    setTicker(`power mode -> ${btn.querySelector(".ctl-name").textContent}`, "new");
   });
 
   $("split-toggle").addEventListener("click", () => {
@@ -496,7 +499,6 @@ function boot() {
   setInterval(drawScope, 1000 / 30);   // scope redraws smoother than the poll rate
   setInterval(tickTicker, 1000 / 30);
   window.addEventListener("resize", drawScope);
-  setTicker("engine handshake complete", "new");
   drawScope();
 }
 

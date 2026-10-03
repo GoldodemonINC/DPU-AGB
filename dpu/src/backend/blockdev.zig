@@ -74,6 +74,18 @@ const POOL_LOCK_NAME: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Lo
 /// clean allocation failure instead of a hung application.
 const POOL_LOCK_TIMEOUT_MS: u32 = 30_000;
 
+/// `WaitForSingleObject` results, spelled numerically rather than taken from
+/// windows.h.
+///
+/// They are public because the test that proves the lock is really released
+/// has to assert on the same constants the implementation branches on, rather
+/// than on a copy that could drift from it. `WAIT_FAILED` (0xFFFFFFFF) is the
+/// only other value the call can return and `acquire` treats it as a failure
+/// rather than as success.
+pub const WAIT_ACQUIRED: u32 = 0x00000000; // WAIT_OBJECT_0
+pub const WAIT_ABANDONED: u32 = 0x00000080; // WAIT_ABANDONED_0
+pub const WAIT_TIMED_OUT: u32 = 0x00000102; // WAIT_TIMEOUT
+
 pub const Error = error{
     PoolOpenFailed,
     PoolExtendFailed,
@@ -84,6 +96,12 @@ pub const Error = error{
     SparseUnsupported,
     PoolCeilingReached,
     PoolOutOfSpace,
+    /// Another process held the pool lock for the whole `POOL_LOCK_TIMEOUT_MS`.
+    /// Reported, never ignored: proceeding unlocked is precisely the torn
+    /// write this lock exists to prevent.
+    PoolLockTimeout,
+    /// The mutex could not be created at open, so no lock exists to take.
+    PoolLockUnavailable,
 };
 
 /// Bytes on disk vs bytes addressable, which is what proves sparseness.
@@ -107,6 +125,11 @@ pub const Stats = struct {
     reads: u64,
     writes: u64,
     flushes: u64,
+    /// Times a pool-lock wait ran out. Non-zero means two processes wanted the
+    /// pool at once and one of them had its transfer refused.
+    lock_timeouts: u64,
+    /// Times a peer died holding the pool lock.
+    lock_abandoned: u64,
 };
 
 pub const Bench = struct {
@@ -134,8 +157,17 @@ pub const BlockDevice = struct {
     /// means this pool is a cached file and its timings are cache timings.
     uncached: bool = false,
     /// Handle for the cross-process pool lock, or null when it could not be
-    /// created (in which case transfers proceed unlocked rather than failing).
+    /// created. This used to mean transfers proceeded unlocked, which is the
+    /// race the mutex was added to prevent; `acquire` now refuses instead.
     lock: ?c.HANDLE = null,
+    /// Times a wait gave up. Surfaced through `Stats` because `flush` and
+    /// `destroy` have `void` signatures fixed by their callers in files this
+    /// module does not own, so a timeout there has nowhere else to go.
+    lock_timeouts: u64 = 0,
+    /// Times the previous owner died holding the lock and Windows handed it to
+    /// us. Worth counting separately: an abandoned lock means the pool metadata
+    /// may have been mid-mutation when that process went away.
+    lock_abandoned: u64 = 0,
     ceiling: u64,
     file_size: u64 = 0,
     /// High-water mark of the highest offset ever written.
@@ -189,6 +221,52 @@ pub const BlockDevice = struct {
         self.allocator.free(@constCast(self.volume));
     }
 
+    /// Take the cross-process pool lock, or fail.
+    ///
+    /// This is the only place `WaitForSingleObject` appears in the module, and
+    /// every call site pairs it with `release` through `defer`, so no path --
+    /// including the error paths -- can return holding the lock and wedge the
+    /// peer process for the full `POOL_LOCK_TIMEOUT_MS`.
+    ///
+    /// The mutex is recursive, which is what makes the nesting safe. `write`
+    /// is called both on its own and from inside `writeUnaligned`, and a
+    /// recursive acquisition by the thread that already owns it returns
+    /// immediately rather than blocking against itself. The matching releases
+    /// balance out, so the lock is held for exactly as long as the outermost
+    /// operation -- which is the intent: `writeUnaligned` keeps it across its
+    /// read-modify-write of the boundary sectors, not just across each write.
+    ///
+    /// A wait that times out is returned as an error rather than allowed to
+    /// fall through. Two processes writing the same 4 KiB region with
+    /// `NO_BUFFERING` interleave into a torn sector that nothing can detect
+    /// afterwards, so "could not get the lock" has to be a loud failure and not
+    /// a quiet write to a region the peer is in the middle of rewriting.
+    pub fn acquire(self: *BlockDevice) Error!void {
+        const m = self.lock orelse return Error.PoolLockUnavailable;
+        switch (c.WaitForSingleObject(m, POOL_LOCK_TIMEOUT_MS)) {
+            WAIT_ACQUIRED => {},
+            // The previous owner died holding it. Windows hands ownership over
+            // anyway; declining would deadlock against a lock nobody is going
+            // to release. It is counted rather than swallowed, because an
+            // abandoned lock means the pool may have been caught mid-mutation.
+            WAIT_ABANDONED => self.lock_abandoned += 1,
+            WAIT_TIMED_OUT => {
+                self.lock_timeouts += 1;
+                return Error.PoolLockTimeout;
+            },
+            else => return Error.PoolLockUnavailable,
+        }
+    }
+
+    /// Drop the pool lock. A no-op when no mutex was created.
+    ///
+    /// Windows `ReleaseMutex` only succeeds for the owning thread, so every
+    /// caller has to release on the same thread that acquired. That holds
+    /// throughout this module: no transfer is handed to another thread.
+    pub fn release(self: *BlockDevice) void {
+        if (self.lock) |m| _ = c.ReleaseMutex(m);
+    }
+
     /// Raise the growth ceiling. Monotonic by design.
     ///
     /// The tier ladder moves the ceiling with the engine's power mode, and a
@@ -200,6 +278,10 @@ pub const BlockDevice = struct {
     ///
     /// Returns the ceiling actually in effect afterwards, which is `new_ceiling`
     /// unless it was lower than what is already in force.
+    ///
+    /// Not under the pool lock: this changes only this process's copy of the
+    /// ceiling. Nothing on disk moves until a later `write` decides whether the
+    /// pool has to grow, and that write takes the lock for itself.
     pub fn raiseCeiling(self: *BlockDevice, new_ceiling: u64) u64 {
         if (new_ceiling > self.ceiling) self.ceiling = new_ceiling;
         return self.ceiling;
@@ -214,9 +296,22 @@ pub const BlockDevice = struct {
     /// suite pointed at the live pool path can clobber a running engine.
     pub fn destroy(self: *BlockDevice) void {
         if (self.open) {
-            _ = c.CloseHandle(self.handle);
-            self.open = false;
-            _ = c.DeleteFileW(self.path.ptr);
+            // Unlinking the pool is a mutation like any other: the peer process
+            // may be reading the file it removes. A timeout cannot be returned
+            // from this signature -- see the note on `flush` -- so it is counted
+            // in `lock_timeouts` and the delete goes ahead anyway. Refusing
+            // would strand a multi-gigabyte scratch pool on the volume, which is
+            // the worse outcome on a path documented as scratch-only.
+            //
+            // Scoped so the release runs before the mutex handle itself is
+            // closed at the end of this function.
+            {
+                self.acquire() catch {};
+                defer self.release();
+                _ = c.CloseHandle(self.handle);
+                self.open = false;
+                _ = c.DeleteFileW(self.path.ptr);
+            }
         }
         if (self.lock) |m| _ = c.CloseHandle(m);
         self.lock = null;
@@ -278,7 +373,18 @@ pub const BlockDevice = struct {
         // the lifetime of the pool, so the two processes interleave at
         // transfer granularity instead of one of them winning outright.
         self.lock = c.CreateMutexW(null, 0, POOL_LOCK_NAME);
+        if (self.lock == null) {
+            // Every mutating path below now calls `acquire`, which fails when
+            // this is null. Refusing to open is louder than opening a pool that
+            // every transfer will then refuse, and it happens once at startup
+            // rather than on the hot path.
+            return Error.PoolLockUnavailable;
+        }
 
+        // Not taken: this rewrites the file's sparse attribute and then waits
+        // on a child process for up to five seconds. The attribute is not part
+        // of the data a peer can tear, so holding the transfer lock across a
+        // child process would serialise both engines' startup for no gain.
         self.sparse = markSparseViaFsutil(self.allocator, self.path);
         self.file_size = self.queryFileSize();
         if (self.file_size > self.ceiling) return Error.OutOfBounds;
@@ -289,6 +395,12 @@ pub const BlockDevice = struct {
     pub fn write(self: *BlockDevice, offset: u64, data: []const u8) !usize {
         try self.checkTransfer(offset, data.len);
         if (!isAlignedPtr(data.ptr)) return Error.NotAligned;
+
+        // Taken after the argument checks, so a call that is going to be refused
+        // anyway does not make the peer queue behind a 30 second wait.
+        try self.acquire();
+        defer self.release();
+
         try self.ensureRoom(offset + data.len);
 
         const start = tickMs();
@@ -312,6 +424,13 @@ pub const BlockDevice = struct {
     pub fn read(self: *BlockDevice, offset: u64, buf: []u8) !usize {
         try self.checkTransfer(offset, buf.len);
         if (!isAlignedPtr(buf.ptr)) return Error.NotAligned;
+
+        // Taken for reads as well as writes. The lock is what stops the peer
+        // replacing the sector underneath a read that is already in flight,
+        // which returns a buffer that is half old and half new data -- a
+        // result no caller can tell apart from real data.
+        try self.acquire();
+        defer self.release();
 
         const start = tickMs();
         var ov: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED);
@@ -344,6 +463,21 @@ pub const BlockDevice = struct {
     /// neighbour that lived there.
     pub fn writeUnaligned(self: *BlockDevice, offset: u64, data: []const u8) !usize {
         if (data.len == 0) return 0;
+
+        // Held across the whole function, not just across each inner `write`.
+        // The boundary sectors are a read-modify-write: read the sector, splice
+        // the caller's bytes in, write it back. Locking only the writes would
+        // let two processes interleave exactly in that window, and each would
+        // write back a sector containing the other's bytes as well as its own
+        // -- silently losing one of them. The inner `write` calls re-acquire
+        // recursively, which is immediate and balanced.
+        //
+        // Safe to hold this long because it is bounded by one caller buffer
+        // (the ICD's largest mapping is a few hundred KiB) rather than by the
+        // pool, and because nothing blocking on disk happens outside the
+        // `write`/`read` calls already inside the critical section.
+        try self.acquire();
+        defer self.release();
 
         if (offset % SECTOR == 0 and data.len % SECTOR == 0 and isAlignedPtr(data.ptr)) {
             _ = try self.write(offset, data);
@@ -408,6 +542,13 @@ pub const BlockDevice = struct {
     pub fn readUnaligned(self: *BlockDevice, offset: u64, buf: []u8) !usize {
         if (buf.len == 0) return 0;
 
+        // As in `writeUnaligned`: one consistent snapshot. The buffer can span
+        // several sectors and the peer may be rewriting any of them, so a
+        // per-sector lock would still return a mix of two different versions of
+        // the data.
+        try self.acquire();
+        defer self.release();
+
         if (offset % SECTOR == 0 and buf.len % SECTOR == 0 and isAlignedPtr(buf.ptr)) {
             _ = try self.read(offset, buf);
             return buf.len;
@@ -441,6 +582,25 @@ pub const BlockDevice = struct {
     /// `FlushFileBuffers` is what makes the write *complete*, and a round-trip
     /// through it is the only honest way to measure device latency.
     pub fn flush(self: *BlockDevice) void {
+        // The failure is not swallowed. `acquire` has already counted it in
+        // `lock_timeouts` and `sample` republishes that count, so a caller can
+        // still see that the pool was contended. What is lost here is only the
+        // distinction between a timeout and an unusable mutex, which a counter
+        // cannot carry, and which cannot be recovered without changing a
+        // signature that four files outside this module already call.
+        self.tryFlush() catch {};
+    }
+
+    /// `flush`, reporting a lock timeout as an error.
+    ///
+    /// The lock is taken here for the same reason the transfers take it:
+    /// `FlushFileBuffers` flushes the whole file rather than one buffer, so a
+    /// peer writing while we time our own flush would make the measurement
+    /// meaningless.
+    pub fn tryFlush(self: *BlockDevice) Error!void {
+        try self.acquire();
+        defer self.release();
+
         const start = tickMs();
         _ = c.FlushFileBuffers(self.handle);
         self.latency_ms = ewma(self.latency_ms, msBetween(start), 0.2);
@@ -456,6 +616,11 @@ pub const BlockDevice = struct {
 
     /// Grow the file so `needed` bytes are addressable, bounded by the ceiling
     /// and by free space on the volume.
+    ///
+    /// Mutates the file, so it wants the pool lock -- but only ever runs from
+    /// `write`, which already holds it, and taking it again would be a
+    /// redundant recursive acquisition. It is kept private precisely so there is
+    /// no way to grow the pool outside a locked `write`.
     fn ensureRoom(self: *BlockDevice, needed: u64) Error!void {
         if (needed <= self.file_size) return;
         if (needed > self.ceiling) return Error.PoolCeilingReached;
@@ -497,6 +662,11 @@ pub const BlockDevice = struct {
     /// `FSCTL_QUERY_ALLOCATED_RANGES` would be the precise answer, but
     /// DeviceIoControl does not reach the driver from this build. The standard
     /// information class reports allocation size directly and needs no ioctl.
+    ///
+    /// Deliberately not under the pool lock: it only asks the filesystem about
+    /// metadata and mutates nothing, and the dashboard calls it on every sample
+    /// tick, so taking a 30 second-capable lock for it would let telemetry
+    /// queue behind a stalled peer for no correctness gain.
     pub fn sparseInfo(self: *BlockDevice) SparseInfo {
         var info: c.FILE_STANDARD_INFO = std.mem.zeroes(c.FILE_STANDARD_INFO);
         const got = c.GetFileInformationByHandleEx(
@@ -537,6 +707,8 @@ pub const BlockDevice = struct {
             .reads = self.reads,
             .writes = self.writes,
             .flushes = self.flushes,
+            .lock_timeouts = self.lock_timeouts,
+            .lock_abandoned = self.lock_abandoned,
         };
     }
 
@@ -547,6 +719,13 @@ pub const BlockDevice = struct {
     /// phase additionally flushes the file system cache first, otherwise a
     /// just-written block could be served from cache and the figure would be
     /// fiction all over again.
+    ///
+    /// Locked per transfer, not for the whole run: each `write`, `read` and
+    /// `flush` inside takes and releases the pool lock itself, and holding it
+    /// across the entire benchmark would stall a live engine for the minutes
+    /// this takes. The cost of that choice is that the figures can include a
+    /// peer's interleaved blocks, which is the right trade for a benchmark that
+    /// has to run against the same pool file the engine uses.
     pub fn benchmark(self: *BlockDevice, block: u64, blocks: usize) !Bench {
         if (block % SECTOR != 0 or block == 0) return Error.NotAligned;
         var stage = try AlignedBuffer.alloc(@intCast(block));

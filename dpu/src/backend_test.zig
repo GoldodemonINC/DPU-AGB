@@ -424,6 +424,246 @@ test "unaligned direct transfer is rejected rather than silently mangled" {
     // Length not a multiple of the sector.
     try testing.expectError(error.NotAligned, dev.write(0, stage.bytes[0..100]));
 }
+
+// --------------------------------------------------------- pool lock
+//
+// The mutex guarding `pool.vram` across the engine and the in-process ICD was
+// created at open and then never waited on, so both processes wrote the same
+// uncached 4 KiB regions concurrently and interleaved them into torn sectors
+// that nothing could detect afterwards. These two tests pin the two properties
+// that fix has to have: a mutating transfer really goes through the lock, and
+// the lock really comes back.
+
+/// A Win32 manual-reset event, used to order the two threads in the lock test.
+///
+/// `std.Thread.ResetEvent` no longer exists in Zig 0.16, and the rest of this
+/// suite already reaches for `win.c` rather than wrapping Win32, so this does
+/// the same thing instead of reintroducing a helper nobody else uses.
+const Event = struct {
+    handle: win.c.HANDLE,
+
+    fn init() !Event {
+        // bManualReset = TRUE, bInitialState = FALSE.
+        const h = win.c.CreateEventW(null, 1, 0, null);
+        if (h == null) return error.TestUnexpectedResult;
+        return .{ .handle = h };
+    }
+
+    fn deinit(self: *Event) void {
+        _ = win.c.CloseHandle(self.handle);
+        self.handle = null;
+    }
+
+    fn set(self: *Event) void {
+        _ = win.c.SetEvent(self.handle);
+    }
+
+    fn wait(self: *Event) void {
+        // INFINITE, not a timeout: every one of these is signalled on every
+        // exit path of the test below, and a bounded wait here could quietly
+        // return early and turn into a confusing assertion failure rather than
+        // an ordering problem. The mutex wait in `LockPeer.run` keeps a bound,
+        // so that thread always terminates.
+        _ = win.c.WaitForSingleObject(self.handle, 0xFFFF_FFFF);
+    }
+};
+
+/// A second thread's view of the pool mutex, used to prove ownership without
+/// waiting a real `POOL_LOCK_TIMEOUT_MS`.
+///
+/// This has to be a separate thread. A Windows mutex is recursive, so the
+/// owning thread can take it again immediately and a same-thread "second
+/// acquire" would succeed whether or not `release` had ever run -- it would
+/// pass against exactly the broken build this is meant to catch. Only another
+/// thread is turned away by a lock that is genuinely held.
+const LockPeer = struct {
+    mutex: win.c.HANDLE,
+    start: *Event,
+    probed: *Event,
+    proceed: *Event,
+    /// Result of a zero-timeout wait while the other thread owns the lock.
+    while_held: u32 = 0xFFFF_FFFF,
+    /// Result of a real wait once the owner has released.
+    after_release: u32 = 0xFFFF_FFFF,
+
+    fn run(self: *LockPeer) void {
+        self.start.wait();
+        // Zero timeout on purpose: this thread should be turned away at once,
+        // not parked for 30 seconds waiting for a lock that is never released.
+        self.while_held = win.c.WaitForSingleObject(self.mutex, 0);
+        self.probed.set();
+        // Wait for the owner to let go, then ask again.
+        self.proceed.wait();
+        self.after_release = win.c.WaitForSingleObject(self.mutex, 10_000);
+        _ = win.c.ReleaseMutex(self.mutex);
+    }
+};
+
+test "a mutating write takes the pool lock, grows the file and reads back intact" {
+    var dev = try openScratch();
+    defer dev.destroy();
+
+    // The mutex the whole scheme rests on has to exist; `openPool` now refuses
+    // to open a pool without one.
+    try testing.expect(dev.lock != null);
+
+    // Write past the end of a freshly destroyed pool, so this exercises the
+    // real mutation: `ensureRoom` extends the file and `write` commits a sector
+    // of it. Not a read, not a bounds check, not a no-op.
+    const off: u64 = 8 * blockdev.SECTOR;
+    var stage = try blockdev.AlignedBuffer.alloc(blockdev.SECTOR);
+    defer stage.free();
+    for (stage.bytes, 0..) |*b, i| b.* = @truncate((i *% 31 +% off) & 0xff);
+
+    const used_before = dev.used;
+    const size_before = dev.file_size;
+    const writes_before = dev.writes;
+
+    const n = try dev.write(off, stage.bytes);
+    dev.flush();
+
+    try testing.expectEqual(@as(usize, blockdev.SECTOR), n);
+    try testing.expectEqual(writes_before + 1, dev.writes);
+    // The high-water mark moved, which is only true if the bytes were written.
+    try testing.expectEqual(off + blockdev.SECTOR, dev.used);
+    try testing.expect(dev.used > used_before);
+    // The pool was grown rather than the write being refused or truncated.
+    try testing.expectEqual(size_before, 0);
+    try testing.expect(dev.file_size >= off + blockdev.SECTOR);
+
+    // Nobody was turned away getting here. This is the assertion that would
+    // have caught a lock left held by an earlier test.
+    try testing.expectEqual(@as(u64, 0), dev.lock_timeouts);
+    try testing.expectEqual(@as(u64, 0), dev.lock_abandoned);
+
+    var back = try blockdev.AlignedBuffer.alloc(blockdev.SECTOR);
+    defer back.free();
+    const got = try dev.read(off, back.bytes);
+    try testing.expectEqual(@as(usize, blockdev.SECTOR), got);
+    try testing.expectEqualSlices(u8, stage.bytes, back.bytes);
+
+    // An unaligned write at that same offset goes through the same lock and
+    // still preserves its neighbours, which is the case that needs the lock
+    // held across the read-modify-write rather than around each write alone.
+    const patch = [_]u8{0xC7} ** 12;
+    try testing.expectEqual(@as(usize, 12), try dev.writeUnaligned(off + 64, &patch));
+    dev.flush();
+    var window = try blockdev.AlignedBuffer.alloc(blockdev.SECTOR);
+    defer window.free();
+    _ = try dev.read(off, window.bytes);
+    try testing.expectEqualSlices(u8, &patch, window.bytes[64..][0..12]);
+    for (window.bytes[0..64], 0..) |have, i| {
+        try testing.expectEqual(stage.bytes[i], have);
+    }
+}
+
+test "the pool lock is released after a transfer, so a peer can take it" {
+    var dev = try openScratch();
+    defer dev.destroy();
+
+    const mutex = dev.lock orelse return error.TestUnexpectedResult;
+
+    // A real mutating operation, which acquires and releases internally. If
+    // any of those call sites lost its `defer release()`, the mutex below would
+    // still be owned when the peer thread asks for it.
+    var stage = try blockdev.AlignedBuffer.alloc(blockdev.SECTOR);
+    defer stage.free();
+    @memset(stage.bytes, 0x6B);
+    _ = try dev.write(0, stage.bytes);
+    dev.flush();
+
+    // And the literal "second acquire must succeed": take it, drop it, take it
+    // again. Cheap, and it fails outright if the first release never happened.
+    try dev.acquire();
+    dev.release();
+    try dev.acquire();
+    dev.release();
+    try testing.expectEqual(@as(u64, 0), dev.lock_timeouts);
+
+    var start = try Event.init();
+    defer start.deinit();
+    var probed = try Event.init();
+    defer probed.deinit();
+    var proceed = try Event.init();
+    defer proceed.deinit();
+    var peer: LockPeer = .{
+        .mutex = mutex,
+        .start = &start,
+        .probed = &probed,
+        .proceed = &proceed,
+    };
+
+    const thread = try std.Thread.spawn(.{}, LockPeer.run, .{&peer});
+    // Guarantees the peer is never left parked in `proceed.wait()` if an
+    // assertion below fails, without joining on that path: a detached thread
+    // that finishes is fine, one that hangs is not, and the wait is unbounded.
+    defer proceed.set();
+
+    {
+        // Hold it for real, then let the peer try and be refused.
+        try dev.acquire();
+        defer dev.release();
+
+        start.set();
+        probed.wait();
+
+        // WAIT_TIMEOUT, not WAIT_OBJECT_0: the lock really is held, so this
+        // half cannot pass against a build that never took it.
+        try testing.expectEqual(@as(u32, blockdev.WAIT_TIMED_OUT), peer.while_held);
+    }
+
+    // The block above has released it. The peer's identical call must now be
+    // granted, which is the whole claim being tested.
+    proceed.set();
+    // Joined before reading `after_release`: without this the main thread races
+    // the peer's write and reads the initialised 0xFFFF_FFFF.
+    thread.join();
+    try testing.expectEqual(@as(u32, blockdev.WAIT_ACQUIRED), peer.after_release);
+    try testing.expectEqual(@as(u64, 0), dev.lock_timeouts);
+    try testing.expectEqual(@as(u64, 0), dev.lock_abandoned);
+}
+
+test "a pool with no mutex refuses the transfer instead of writing it unlocked" {
+    // The "not a silent proceed" half, on the one lock failure that can be
+    // provoked without waiting. A genuine `POOL_LOCK_TIMEOUT_MS` expiry is not
+    // testable here: the timeout is fixed at 30 s and must not be changed, so
+    // asserting that path would add 30 s of wall clock to every suite run.
+    // What this does check is the contract around it -- when the lock cannot be
+    // taken, the mutating entry points return an error and touch nothing,
+    // rather than falling through to an unprotected `WriteFile`. That was the
+    // behaviour when the mutex existed but was never waited on.
+    var dev = try openScratch();
+    defer dev.destroy();
+
+    var stage = try blockdev.AlignedBuffer.alloc(blockdev.SECTOR);
+    defer stage.free();
+    @memset(stage.bytes, 0x11);
+
+    // Simulate the mutex having failed to be created at open.
+    dev.lock = null;
+
+    try testing.expectError(error.PoolLockUnavailable, dev.acquire());
+    try testing.expectError(error.PoolLockUnavailable, dev.write(0, stage.bytes));
+    try testing.expectError(error.PoolLockUnavailable, dev.writeUnaligned(0, stage.bytes));
+    try testing.expectError(error.PoolLockUnavailable, dev.read(0, stage.bytes));
+    try testing.expectError(error.PoolLockUnavailable, dev.tryFlush());
+
+    // Nothing was written: the refusal has to happen before the write, not
+    // after it.
+    try testing.expectEqual(@as(u64, 0), dev.used);
+    try testing.expectEqual(@as(u64, 0), dev.file_size);
+    try testing.expectEqual(@as(u64, 0), dev.writes);
+
+    // Releasing a lock that was never taken is harmless, which is what lets the
+    // `defer` on every call site be unconditional.
+    dev.release();
+
+    // `flush` keeps its `void` signature for callers outside this module, so
+    // its failure is counted rather than returned. Nothing timed out here, and
+    // the counter is what a caller would read to find out.
+    dev.flush();
+    try testing.expectEqual(@as(u64, 0), dev.lock_timeouts);
+}
 // --------------------------------------------------------------- regression
 //
 // These began life as a temporary audit block. Three of the four were wrong

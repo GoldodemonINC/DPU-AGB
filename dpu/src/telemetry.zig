@@ -244,11 +244,11 @@ fn classify(name: []const u8) Role {
     const trimmed = stripExe(name);
 
     const agent_names = [_][]const u8{
-        "ollama",     "ollama_llama_server", "llama-server", "llama-cli",
-        "ollama_llama", "wsl-host",          "llama",        "koboldcpp",
+        "ollama",       "ollama_llama_server", "llama-server", "llama-cli",
+        "ollama_llama", "wsl-host",            "llama",        "koboldcpp",
     };
     const gfx_names = [_][]const u8{
-        "lossless scaling", "losslessscaling", "gamebar", "obs64",
+        "lossless scaling", "losslessscaling", "gamebar",  "obs64",
         "steam",            "dwm",             "explorer", "chrome",
         "msedge",           "firefox",
     };

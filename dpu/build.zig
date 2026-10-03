@@ -2,21 +2,29 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // One optimise mode for the entire graph, defaulting to ReleaseSafe.
+    //
+    // This used to be `standardOptimizeOption(.{})`, which defaults to Debug,
+    // while the shared backend modules were pinned to `.optimize = .Debug`
+    // anyway -- so `zig build -Doptimize=ReleaseFast icd` produced a driver
+    // whose root was ReleaseFast and whose block layer, tier resolver and
+    // allocator were Debug. Half of the shipped driver was never optimised,
+    // and the fix for that (three separate module graphs, one per optimise
+    // mode) meant compiling windows.h and vulkan_core.h three times per build.
+    //
+    // ReleaseSafe rather than ReleaseFast because the bounds work from the
+    // audit -- buffer-relative extents, saturated `fitsInAllocation`,
+    // partial-sector read-modify-write -- is only worth having if the checks
+    // are still compiled in. Zero-cost when correct, an error the moment it is
+    // not. `--release=fast` still opts out of them.
+    //
+    // Note what this does *not* change: with no `--release` flag the mode is
+    // still Debug, which is what makes `zig build test` cheap to read a stack
+    // trace out of. `zig build --release=safe icd` is the shipping build and it
+    // now reaches the block layer, the tier resolver and the allocator.
+    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
 
     // ----------------------------------------------------------- shared modules
-    //
-    // `win` and `tiers` are shared, not duplicated, and that is a correctness
-    // property rather than tidiness. The Vulkan ICD runs inside somebody else's
-    // process and has to reach the same pool file through the same block
-    // semantics as the engine that created it. If the driver carried its own
-    // copy of the tier ladder or its own Win32 wrappers, the two would drift
-    // and the driver would advertise capacity the pool never agreed to.
-    //
-    // They are anonymous imports rather than relative `@import("../win.zig")`
-    // inside the backend files because a relative import cannot escape its
-    // module's root directory -- which is exactly what the ICD would need.
-    // Shared modules.
     //
     // `win`, `tiers`, `blockdev` and `alloc` are built once and imported by
     // everyone, which is a correctness property rather than tidiness: the Vulkan
@@ -32,21 +40,81 @@ pub fn build(b: *std.Build) void {
     const win_mod = b.createModule(.{
         .root_source_file = b.path("src/win.zig"),
         .target = target,
-        .optimize = .Debug,
+        .optimize = optimize,
         .link_libc = true,
     });
+
+    // ------------------------------------------------- translate-c workaround
+    //
+    // Zig 0.16's translate-c emits invalid Zig for MinGW's `_FORTIFY_SOURCE`
+    // inline wrappers, which makes `zig build --release=safe icd` fail with
+    // "error: unused local constant" on two decls. The shape it generates is:
+    //
+    //     pub inline fn wcscat(...) {
+    //         ...
+    //         if (<object size known>) {
+    //             const extern_local_wcscat_s = struct {      // no marker
+    //                 extern fn wcscat_s(...) errno_t;
+    //             };
+    //             const extern_local___chk_fail = struct {...};
+    //             _ = &extern_local___chk_fail;               // marker present
+    //             if (__builtin_expect(!(wcscat_s(...)), 1) != 0) ... else __chk_fail();
+    //             return __dst;
+    //         }
+    //         ...
+    //     }
+    //
+    // `wcscat_s` *is* referenced, in the `if` condition -- but translate-c's
+    // unroller records references made from a condition separately from the
+    // ones made from the branches, so it emits the `_ = &local;` used-marker
+    // for the sibling `__chk_fail` decl and silently omits it for the `*_s`
+    // decl. Zig's Sema then agrees the decl is unused and refuses the file.
+    // That is a toolchain bug: the input C is fine and the fix belongs in
+    // Zig's translate-c, not in this repository.
+    //
+    // It only shows up in release builds because MinGW gates the wrappers on
+    // `__OPTIMIZE__` as well as `_FORTIFY_SOURCE`
+    // (libc/include/any-windows-any/_mingw_mac.h:332), so Debug never emits
+    // them. That is why this went unnoticed until the shared modules stopped
+    // being pinned to Debug and the driver's imports started being compiled
+    // in the shipping mode.
+    //
+    // The workaround is `_FORTIFY_SOURCE=0`, which drops `__MINGW_FORTIFY_LEVEL`
+    // to 0 so the inline wrappers are never declared and the broken code is
+    // never generated. Does that weaken anything real? No, and here is the
+    // whole argument rather than an assurance:
+    //
+    //   * This project compiles zero C source files. `find . -name '*.c'`
+    //     returns nothing, and no module calls `addCSourceFiles`. Fortification
+    //     is a C compiler feature that instruments C code being *compiled*;
+    //     there is no such code here to instrument.
+    //   * `@cImport` reads the MinGW headers for *declarations only*. With the
+    //     wrappers off, `memcpy`/`wcscat`/`sprintf` are plain `extern`
+    //     declarations instead of inline functions -- the same symbols, still
+    //     resolved from msvcrt at link time.
+    //   * No Zig source in this tree calls any fortified wrapper. Every
+    //     `memcpy` in src/ is the Zig builtin `@memcpy`, which is lowered by
+    //     Zig and is unaffected by any C define.
+    //
+    // The alternative workarounds were both rejected on purpose. Pinning this
+    // module to Debug would duplicate `win` into a second module graph, and
+    // duplicating a shared module is the one drift this project cannot absorb.
+    // Post-processing the generated cimport would mean shipping a patched copy
+    // of a toolchain artifact. This one changes no Zig semantics, keeps all
+    // four shared modules singular, and keeps the driver in ReleaseSafe.
+    win_mod.addCMacro("_FORTIFY_SOURCE", "0");
 
     const tiers_mod = b.createModule(.{
         .root_source_file = b.path("src/backend/tiers.zig"),
         .target = target,
-        .optimize = .Debug,
+        .optimize = optimize,
         .link_libc = true,
     });
 
     const blockdev_mod = b.createModule(.{
         .root_source_file = b.path("src/backend/blockdev.zig"),
         .target = target,
-        .optimize = .Debug,
+        .optimize = optimize,
         .link_libc = true,
     });
     blockdev_mod.addImport("win", win_mod);
@@ -55,74 +123,19 @@ pub fn build(b: *std.Build) void {
     const alloc_mod = b.createModule(.{
         .root_source_file = b.path("src/backend/alloc.zig"),
         .target = target,
-        .optimize = .Debug,
+        .optimize = optimize,
         .link_libc = true,
     });
     alloc_mod.addImport("win", win_mod);
     alloc_mod.addImport("blockdev", blockdev_mod);
     alloc_mod.addImport("tiers", tiers_mod);
 
-    // Release-optimised twins for the two artefacts that are measured or shipped.
-    // Same sources; only the optimise mode differs.
-    const bench_win = b.createModule(.{
-        .root_source_file = b.path("src/win.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-        .link_libc = true,
-    });
-    const bench_tiers = b.createModule(.{
-        .root_source_file = b.path("src/backend/tiers.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-        .link_libc = true,
-    });
-    const bench_blockdev = b.createModule(.{
-        .root_source_file = b.path("src/backend/blockdev.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-        .link_libc = true,
-    });
-    bench_blockdev.addImport("win", bench_win);
-    bench_blockdev.addImport("tiers", bench_tiers);
-    const bench_alloc = b.createModule(.{
-        .root_source_file = b.path("src/backend/alloc.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-        .link_libc = true,
-    });
-    bench_alloc.addImport("win", bench_win);
-    bench_alloc.addImport("blockdev", bench_blockdev);
-    bench_alloc.addImport("tiers", bench_tiers);
-
-    const icd_win = b.createModule(.{
-        .root_source_file = b.path("src/win.zig"),
-        .target = target,
-        .optimize = .ReleaseSmall,
-        .link_libc = true,
-    });
-    const icd_tiers = b.createModule(.{
-        .root_source_file = b.path("src/backend/tiers.zig"),
-        .target = target,
-        .optimize = .ReleaseSmall,
-        .link_libc = true,
-    });
-    const icd_blockdev = b.createModule(.{
-        .root_source_file = b.path("src/backend/blockdev.zig"),
-        .target = target,
-        .optimize = .ReleaseSmall,
-        .link_libc = true,
-    });
-    icd_blockdev.addImport("win", icd_win);
-    icd_blockdev.addImport("tiers", icd_tiers);
-    const icd_alloc = b.createModule(.{
-        .root_source_file = b.path("src/backend/alloc.zig"),
-        .target = target,
-        .optimize = .ReleaseSmall,
-        .link_libc = true,
-    });
-    icd_alloc.addImport("win", icd_win);
-    icd_alloc.addImport("blockdev", icd_blockdev);
-    icd_alloc.addImport("tiers", icd_tiers);
+    // There used to be two more copies of these four modules here -- ReleaseFast
+    // twins for the benchmark and ReleaseSmall twins for the driver -- because
+    // a module's optimise mode is fixed where it is declared, and the shared
+    // ones were pinned to Debug. Deleting them is what makes `--release=fast`
+    // reach the block layer and the tier resolver at all, and it cuts a cold
+    // build from three `windows.h` + `vulkan_core.h` compiles to one.
 
     // ------------------------------------------------------------------ engine
     //
@@ -208,7 +221,7 @@ pub fn build(b: *std.Build) void {
     const icd_test_mod = b.createModule(.{
         .root_source_file = b.path("src/backend/icd/icd.zig"),
         .target = target,
-        .optimize = .Debug,
+        .optimize = optimize,
         .link_libc = true,
     });
     icd_test_mod.addIncludePath(b.path("third_party"));
@@ -238,13 +251,13 @@ pub fn build(b: *std.Build) void {
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
         .link_libc = true,
     });
-    bench_mod.addImport("win", bench_win);
-    bench_mod.addImport("tiers", bench_tiers);
-    bench_mod.addImport("blockdev", bench_blockdev);
-    bench_mod.addImport("alloc", bench_alloc);
+    bench_mod.addImport("win", win_mod);
+    bench_mod.addImport("tiers", tiers_mod);
+    bench_mod.addImport("blockdev", blockdev_mod);
+    bench_mod.addImport("alloc", alloc_mod);
     bench_mod.linkSystemLibrary("pdh", .{});
     bench_mod.linkSystemLibrary("psapi", .{});
 
@@ -266,14 +279,14 @@ pub fn build(b: *std.Build) void {
     const icd_mod = b.createModule(.{
         .root_source_file = b.path("src/backend/icd/icd.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = optimize,
         .link_libc = true,
     });
     icd_mod.addIncludePath(b.path("third_party"));
-    icd_mod.addImport("win", icd_win);
-    icd_mod.addImport("tiers", icd_tiers);
-    icd_mod.addImport("blockdev", icd_blockdev);
-    icd_mod.addImport("alloc", icd_alloc);
+    icd_mod.addImport("win", win_mod);
+    icd_mod.addImport("tiers", tiers_mod);
+    icd_mod.addImport("blockdev", blockdev_mod);
+    icd_mod.addImport("alloc", alloc_mod);
     icd_mod.linkSystemLibrary("pdh", .{});
     icd_mod.linkSystemLibrary("psapi", .{});
 
@@ -297,8 +310,7 @@ pub fn build(b: *std.Build) void {
     // relative library_path resolves, which keeps the pair portable: copy the
     // two files anywhere and the loader still finds them.
     const manifest_writer = b.addWriteFiles();
-    const manifest = manifest_writer.add("vk_icd.json",
-        "{\"file_format_version\":\"1.0.0\",\"ICD\":{\"library_path\":\".\\\\dpu_icd.dll\",\"api_version\":\"1.3\"}}");
+    const manifest = manifest_writer.add("vk_icd.json", "{\"file_format_version\":\"1.0.0\",\"ICD\":{\"library_path\":\".\\\\dpu_icd.dll\",\"api_version\":\"1.3\"}}");
     const install_manifest = b.addInstallFileWithDir(manifest, .bin, "vk_icd.json");
 
     // ---------------------------------------------------------------- launcher
@@ -319,8 +331,7 @@ pub fn build(b: *std.Build) void {
     //
     // So the deliverable is a launcher. It sets VK_ADD_DRIVER_FILES for one
     // command and exits, leaving nothing behind for other programs to inherit.
-    const launcher = manifest_writer.add("dpu-vulkan.cmd",
-        "@echo off\r\nrem Run a Vulkan application with the DPU visible to it, and to nothing else.\r\nrem\r\nrem   dpu-vulkan.cmd llama-server.exe --model ggml-org-model.gguf\r\nrem\r\nrem VK_ADD_DRIVER_FILES (not VK_DRIVER_FILES) appends to the drivers the loader\r\nrem already found, so the real GPU stays visible alongside the DPU.\r\nsetlocal\r\nset \"VK_ADD_DRIVER_FILES=%~dp0vk_icd.json\"\r\n%*");
+    const launcher = manifest_writer.add("dpu-vulkan.cmd", "@echo off\r\nrem Run a Vulkan application with the DPU visible to it, and to nothing else.\r\nrem\r\nrem   dpu-vulkan.cmd llama-server.exe --model ggml-org-model.gguf\r\nrem\r\nrem VK_ADD_DRIVER_FILES (not VK_DRIVER_FILES) appends to the drivers the loader\r\nrem already found, so the real GPU stays visible alongside the DPU.\r\nsetlocal\r\nset \"VK_ADD_DRIVER_FILES=%~dp0vk_icd.json\"\r\n%*");
     const install_launcher = b.addInstallFileWithDir(launcher, .bin, "dpu-vulkan.cmd");
 
     const icd_step = b.step("icd", "Build dpu_icd.dll + vk_icd.json + dpu-vulkan.cmd");
@@ -338,7 +349,7 @@ pub fn build(b: *std.Build) void {
     const probe_mod = b.createModule(.{
         .root_source_file = b.path("src/backend/icd/probe.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = optimize,
         .link_libc = true,
     });
     // Deliberately NOT linked against vulkan-1. The probe loads the loader with
@@ -372,4 +383,20 @@ pub fn build(b: *std.Build) void {
 
     const probe_step = b.step("probe", "Load the real Vulkan loader and verify the DPU enumerates");
     probe_step.dependOn(&run_probe.step);
+
+    // ------------------------------------------------------------------- check
+    //
+    // Formatting and tests in one gate, because a test suite that does not
+    // also assert formatting is a suite where the formatting silently rots.
+    // `zig fmt --check` was failing on all sixteen sources, so this step is
+    // only honest now that the tree has been formatted.
+    const check_step = b.step("check", "Formatting, unit tests and Vulkan ABI assertions");
+    check_step.dependOn(&b.addFmt(.{
+        .paths = &.{ "build.zig", "src", "web" },
+        .check = true,
+    }).step);
+    check_step.dependOn(&run_tests.step);
+    check_step.dependOn(&run_tiers_tests.step);
+    check_step.dependOn(&run_icd_tests.step);
+    check_step.dependOn(&b.addRunArtifact(abi_tests).step);
 }

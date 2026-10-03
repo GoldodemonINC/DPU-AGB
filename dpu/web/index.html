@@ -111,15 +111,15 @@
     <div class="ctl-group">
       <label class="ctl-label">POWER MODE</label>
       <div class="ctl-buttons" id="power-group">
-        <button class="ctl-btn" data-power="max">
+        <button class="ctl-btn" data-power="MAX">
           <span class="ctl-name">MAX</span>
           <span class="ctl-desc">aggressive prefetch</span>
         </button>
-        <button class="ctl-btn" data-power="xhigh">
+        <button class="ctl-btn" data-power="xHIGH">
           <span class="ctl-name">xHIGH</span>
           <span class="ctl-desc">balanced</span>
         </button>
-        <button class="ctl-btn" data-power="low">
+        <button class="ctl-btn" data-power="LOW">
           <span class="ctl-name">LOW</span>
           <span class="ctl-desc">minimal IO</span>
         </button>
@@ -128,7 +128,7 @@
 
     <div class="ctl-group">
       <label class="ctl-label">PREFETCH DEPTH</label>
-      <div class="prefetch-value" id="prefetch-value">4</div>
+      <div class="prefetch-value" id="prefetch-value">--</div>
     </div>
 
     <div class="ctl-group">
@@ -140,23 +140,14 @@
       <div class="ctl-note">Partition VRAM buffer across active agent contexts</div>
     </div>
 
-    <div class="ctl-group">
+    <div class="ctl-group grow">
       <label class="ctl-label">VRAM BUFFER</label>
-      <div class="pool-path" id="pool-path">P:\DPU\pool.vram</div>
       <div class="sysline"><span>CEILING</span><b id="buf-ceiling">--</b></div>
       <div class="sysline"><span>USED</span><b id="buf-used">--</b></div>
       <div class="sysline"><span>ON DISK</span><b id="buf-alloc">--</b></div>
       <div class="sysline"><span>LATENCY</span><b id="buf-latency">--</b></div>
       <div class="sysline"><span>SPARSE</span><b id="buf-sparse">--</b></div>
       <div class="ctl-note" id="pool-note">--</div>
-    </div>
-
-    <div class="ctl-group grow">
-      <label class="ctl-label">SYSTEM</label>
-      <div class="sysline"><span>CPU CORES</span><b>4</b></div>
-      <div class="sysline"><span>PHYSICAL RAM</span><b>7.8 GB</b></div>
-      <div class="sysline"><span>ADAPTERS</span><b>Intel UHD</b></div>
-      <div class="sysline"><span>HVCI</span><b class="warn">ACTIVE</b></div>
     </div>
   </section>
 </main>
