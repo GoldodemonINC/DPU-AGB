@@ -1,0 +1,16 @@
+# The repository stores CRLF line endings -- `dpu/src/pool.zig` has 292 CR bytes
+# in its blob, not 0 -- and `zig fmt --check` is one of the gate's steps.
+#
+# Without this file, a default Windows clone has `core.autocrlf=true`, which
+# re-smudges those already-CRLF blobs into CRCRLF. Measured: `pool.zig` goes
+# from 292 CR bytes to 473, `build.zig` from 863 to 1281, and `zig fmt --check`
+# then fails on all eleven Zig files, so `zig build check` is red out of the box
+# on the platform this project is developed on.
+#
+# Worse, `git status` still reports the tree as clean while it is corrupted, so
+# nothing surfaces the problem until the gate runs.
+#
+# Marking everything non-text makes the checkout byte-exact whatever
+# `core.autocrlf` says, and git still renders text diffs for these files rather
+# than calling them binary.
+* -text

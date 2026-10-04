@@ -13,4 +13,3 @@ zig-out/
 
 # Runtime state
 engine.log
-.freebuff/
