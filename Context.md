@@ -357,10 +357,19 @@ reverted:
 | a miss answers `200 OK` instead of `404 Not Found` | `CHECK_EXIT=1` — the wire matrix failed, alongside five unit tests that already covered the same claim |
 | the top-level `total` object deleted from the serializer | `CHECK_EXIT=1` — `telemetry has no top-level key total; top-level keys are: t uptimeMs engine counters pool procs buffer` |
 | the `latencyMs` field deleted from the `buffer` object | `CHECK_EXIT=1` — `buffer has no field latencyMs`, with the fifteen surviving names listed. `110/111` |
+| the scratch pool opened but never attached to the harness | `CHECK_EXIT=1` — `buffer is null: the scratch pool did not attach`. `110/111` |
 | `serveAsset` re-decides framing instead of trusting the `Decision` | `CHECK_EXIT=1` — the asset-HEAD test and the phantom-body test failed. A handler reaching back across the module boundary to re-derive a fact the router already decided |
 
 The first is the point of the file. That regression is invisible to every test
 above the socket, and it is exactly the defect #7 exists to remove.
+
+The fifth is the one that keeps the fourth honest. Every field assertion in the
+`buffer` test sits behind the pool being open, so a harness that opened a pool
+and then forgot to attach it would skip the lot and report success for having
+checked nothing — the tautology this suite has already produced once. The test
+returns `error.BufferIsNull` instead, and that path was proven by deleting the
+attach line and watching the gate go red, rather than being trusted because it
+reads that way.
 
 The third one is worth keeping for a different reason: **the first version of
 that test did not catch it.** It searched the document for the substring
