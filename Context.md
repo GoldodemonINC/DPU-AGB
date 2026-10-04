@@ -208,7 +208,7 @@ What the suite asserts, and why each one is not a restatement of the code:
 | a malformed line is 400 even when its target names no route | the malformed check runs before any route lookup: four shapes naming `/nope` answer the same 400 as the shapes that named nothing, so a client cannot use a malformed request to discover whether a path exists |
 | valid request lines that look unusual still route | #6 did not over-reach: a line with no trailing CRLF, and one with a leading space, still serve |
 | a control write is visible in the telemetry that follows it | POST `power=low`, then GET telemetry and find `"power":"LOW"` and `"prefetch":1` — the dashboard's own exchange, as a gate check rather than a demo |
-| every asset answers HEAD with its GET length and no bytes | derived from `server.ASSETS`, not restated — see below |
+| every asset answers HEAD with its GET length and no bytes | derived from `assets.ASSETS`, not restated — see below |
 | HEAD on a miss is the miss, with no bytes | the same rule over paths that do not route: "no body" has to be a property of the response path, not of the asset table |
 | only HEAD suppresses the body | the negative case: every other verb still gets its body, so the HEAD results are not an artefact of everything being empty |
 | the telemetry document keeps every key the dashboard parses | the eight top-level keys and the three `engine` keys, read at their own JSON depth — every other assertion in the suite counts bytes, and a dropped field changes the length and nothing else |
@@ -222,7 +222,7 @@ see that 5744 bytes arrived anyway.
 
 ### Coverage is derived, not restated
 
-The asset tests iterate `server.ASSETS`, which is why `Asset` and `ASSETS` are
+The asset tests iterate `assets.ASSETS`, which is why `Asset` and `ASSETS` are
 `pub`. The first version carried a written-out list of asset paths, and that is
 a second thing that has to agree with the router — it would have stopped
 agreeing the day somebody added an asset, and nothing would have said so. This
