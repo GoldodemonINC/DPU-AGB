@@ -1,0 +1,60 @@
+diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
+index 9477320..d592821 100644
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -199,6 +199,8 @@ add_library(ggml-base
+             ggml.c
+             ggml.cpp
+             ggml-alloc.c
++            ggml-dpu.c
++            ggml-dpu.h
+             ggml-backend.cpp
+             ggml-backend-meta.cpp
+             ggml-opt.cpp
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 9bcabdb..8bdc0f5 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6,6 +6,7 @@
+ #include "ggml-impl.h"
+ #include "ggml-threading.h"
+ #include "ggml-cpu.h"
++#include "ggml-dpu.h"
+ #include "ggml.h"
+ 
+ // FIXME: required here for quantization functions
+@@ -336,6 +337,20 @@ void * ggml_aligned_malloc(size_t size) {
+     const int alignment = 64;
+ #endif
+ 
++#if defined(_WIN32)
++    // DPU: give the large blocks to the disk-backed pool first, so that a model
++    // bigger than RAM does not have to live in commit. This returns NULL unless
++    // GGML_DPU_POOL is set and the pool can serve the request, so the allocator
++    // below is still the path everything else takes. MapViewOfFile hands back a
++    // page-aligned address, which satisfies `alignment` as well.
++    {
++        void * dpu = ggml_dpu_malloc(size);
++        if (dpu != NULL) {
++            return dpu;
++        }
++    }
++#endif
++
+ #if defined(_MSC_VER) || defined(__MINGW32__)
+     return _aligned_malloc(size, alignment);
+ #else
+@@ -387,6 +402,13 @@ void * ggml_aligned_malloc(size_t size) {
+ 
+ void ggml_aligned_free(void * ptr, size_t size) {
+     GGML_UNUSED(size);
++#if defined(_WIN32)
++    // Symmetric with the pool attempt in ggml_aligned_malloc: a pointer the
++    // pool handed out is unmapped, anything else falls through untouched.
++    if (ggml_dpu_free(ptr)) {
++        return;
++    }
++#endif
+ #if defined(_MSC_VER) || defined(__MINGW32__)
+     _aligned_free(ptr);
+ #elif GGML_USE_CPU_HBM
