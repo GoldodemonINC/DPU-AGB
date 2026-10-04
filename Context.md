@@ -470,6 +470,66 @@ picks the framing from the same `line`, so the two cannot come from different
 reads. `respond` takes `Framing` as a required parameter, so the compiler rejects
 a handler that forgets to thread it.
 
+## Route 1 measured: llama.cpp on the DPU pool
+
+The first idea in the two-ideas diagram is DPU to llama.cpp to an 8B model at
+10-40 TPS. It was measured rather than argued, and the answer is not the one the
+diagram assumes. Patch, test and full numbers are in
+`dpu/third_party/llama-dpu/README.md`.
+
+The premise is sound, and this machine is the reason. There is **7.79 GiB of
+RAM**; an 8B Q4_K_M model is ~4.9 GiB of weights before a KV cache exists.
+Every tensor the CPU backend does not memory-map comes from
+`ggml_aligned_malloc`, which on Windows is `_aligned_malloc`: private,
+anonymous, charged to commit and never reclaimable. So a small change makes
+`ggml_aligned_malloc` offer the allocation to DPU's pool first, mapping
+`P:\DPU\pool.vram` instead of allocating, and the same bytes become
+file-backed. Opt in with `GGML_DPU_POOL=1`. Every failure mode -- absent,
+locked by another process, exhausted, under 4 MiB -- falls back to `malloc`.
+
+It works, and it is not worth having. Same command, only `GGML_DPU_POOL`
+differing:
+
+| model | peak commit | load | generation | exit |
+| --- | --- | --- | --- | --- |
+| `gemma-2-9b-it` Q4_K_M, pool off | 8246 MB | 31 s | 2.51 tok/s | 0 |
+| `gemma-2-9b-it` Q4_K_M, pool on | 6562 MB | **32989 s** | 0.14 tok/s | 0 |
+| `Llama-3.2-3B` Q4_K_M, pool off | 8353 MB | 12 s | 7.54 tok/s | 0 |
+| `Llama-3.2-3B` Q4_K_M, pool on | 7734 MB | 11.9 s | 2.63 tok/s | 0 |
+
+Peak commit fell by 619 MB on the 3B and 1684 MB on the 9B -- not the 1.87 GB /
+5.76 GB of weights -- while generation went 2.87x slower, and at 9B the load
+went from 31 s to **9.2 hours**. The allocator is not the reason.
+`GGML_DPU_STATS=1` shows the one large allocation (the weight buffer) served
+from the pool, with all 1246 graph temporaries correctly below the 4 MiB
+threshold and left to `malloc`; and `poolspeed` writes **1428 MB/s** through a
+2 GiB pool mapping and reads every byte of it back at **3942 MB/s** warm,
+against 949 MB/s for a plain `dd` write to `P:`, so neither the code nor the
+device is the bottleneck. Task Manager shows the run pegged at 100% disk,
+which is the same fact from the other side.
+
+The reason is that **file-backed does not mean free**. Mapping the pool is
+charged to the page cache rather than to commit, and the counters show it -- but
+the pages are still resident RAM while the process touches them, and generating
+a token re-reads essentially the whole weight set. At 9B that is ~5.76 GB of
+reads per token on a machine with 7.79 GiB of RAM. The pool cannot cache a
+working set that large, so the demand does not disappear; it turns into
+reclaim and re-read, which is the 9.2 hours.
+
+So **holding model weights in the pool is the wrong lever**. The pool is a
+capacity tool, and what belongs in it is what is *not* re-read every token. The
+10-40 TPS target is gated by memory bandwidth and by these four cores, not by
+where the bytes are filed: a stock CPU-only llama.cpp with no DPU at all already
+does 7.54 tok/s on the 3B and 2.51 tok/s on the 9B.
+
+The code is kept because the measurement is reusable and `dputest` is a real
+test -- 21/21 with the pool on, 3/3 with it off -- not because it is the route
+to an 8B model. The route to one is a compute path the ICD does not have: of the
+fourteen entry points a Vulkan compute client needs,
+`vkCreateShaderModule` and `vkCreateComputePipelines` are present and refused,
+and the other twelve -- `vkCmdDispatch`, every descriptor-set entry point,
+`vkCreatePipelineLayout` -- are absent from `src/backend/icd/icd.zig`.
+
 ## What comes next
 
 1. **Retire #5, #6 and #7.** They are fully contained in #8. Closing them is the
