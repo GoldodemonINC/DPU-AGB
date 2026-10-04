@@ -36,6 +36,7 @@ const std = @import("std");
 const testing = std.testing;
 const wire = @import("wire_harness.zig");
 const assets = @import("server/assets.zig");
+const pool_mod = @import("pool.zig");
 
 const Harness = wire.Harness;
 const Response = wire.Response;
@@ -415,12 +416,10 @@ test "the telemetry document keeps every key the dashboard parses" {
     // dropped in a refactor changes the length and nothing else, so a
     // count-based check sails straight past it.
     //
-    // The `buffer` object's sixteen fields are deliberately absent from this
-    // list: they are only emitted when the capacity pool is open, and the gate
-    // deliberately runs without one so it never touches `P:\DPU\pool.vram`.
-    // They are checked against a running engine instead -- a weaker guarantee,
-    // recorded as such rather than papered over with a conditional assertion
-    // that passes either way.
+    // The `buffer` object's sixteen fields are not in this list. They need a
+    // capacity pool open, which this test does not do; they are asserted in
+    // `the telemetry buffer keeps every field, with a pool open`, which opens a
+    // scratch pool of its own and unlinks it afterwards.
     const h = try wire.harness();
     const r = try h.get("GET", "/api/telemetry");
 
@@ -460,6 +459,82 @@ test "the telemetry document keeps every key the dashboard parses" {
     try testing.expectEqual(@as(u8, '}'), r.body[r.body.len - 1]);
     try r.expectLengthMatchesBody();
     try expectStatus(r, "200 OK", "GET /api/telemetry");
+}
+
+/// The `buffer` object's fields, which are only emitted when the capacity pool
+/// is open.
+const BUFFER_FIELDS = [_][]const u8{
+    "ceiling",     "length",      "used",        "allocated",
+    "saturation",  "readBps",     "writeBps",    "latencyMs",
+    "reads",       "writes",      "sparse",      "tierRequested",
+    "tierGranted", "tierClamped", "tierStarved", "volumeFree",
+};
+
+test "the telemetry buffer keeps every field, with a pool open" {
+    // The largest part of the document, and the part the gate could not see:
+    // `buffer` is null unless the capacity pool is open, and the gate
+    // deliberately runs without one so it never touches the live
+    // `P:\DPU\pool.vram`. So this test opens a scratch pool of its own.
+    const h = try wire.harness();
+    // `var`, and the `defer` after the call: the pool lives in this frame for
+    // the whole test, and a failed open leaves nothing to detach.
+    var scratch: wire.Scratch = undefined;
+    try h.openScratchPool(&scratch);
+    defer scratch.detach(h);
+
+    const r = try h.get("GET", "/api/telemetry");
+
+    const at = std.mem.indexOf(u8, r.body, "\"buffer\":") orelse return error.NoBuffer;
+
+    // Fails loudly rather than passing on the null branch. If the scratch pool
+    // failed to attach, every field assertion below would be skipped and the
+    // test would report success for having checked nothing.
+    if (std.mem.startsWith(u8, r.body[at + "\"buffer\":".len ..], "null")) {
+        std.debug.print("\n  buffer is null: the scratch pool did not attach\n  {s}\n", .{r.body});
+        return error.BufferIsNull;
+    }
+
+    const open = std.mem.indexOfScalarPos(u8, r.body, at, '{') orelse return error.NoBuffer;
+    const close = std.mem.indexOfScalarPos(u8, r.body, open, '}') orelse return error.NoBuffer;
+    // Every field in `buffer` is a scalar, so there is no nested object and the
+    // first `}` closes it. `topLevelKeys` assumes that, and this is where the
+    // assumption is stated rather than left implicit.
+    const obj = r.body[open .. close + 1];
+
+    var found: [32][]const u8 = undefined;
+    const keys = topLevelKeys(obj, &found);
+    for (BUFFER_FIELDS) |field| {
+        testing.expect(hasKey(keys, field)) catch |e| {
+            std.debug.print("\n  buffer has no field {s}\n  buffer fields are:", .{field});
+            for (keys) |k| std.debug.print(" {s}", .{k});
+            std.debug.print("\n  {s}\n", .{obj});
+            return e;
+        };
+    }
+
+    // Not vacuous: every declared field was found, and the object holds nothing
+    // beyond them.
+    try testing.expectEqual(BUFFER_FIELDS.len, keys.len);
+
+    // The values as well, because the key set alone cannot tell a real pool
+    // from a stale one. A `Pool` read through a pointer to a frame that has
+    // already returned still serialises into a well-formed object carrying all
+    // sixteen keys; what it carries is nonsense. Nothing has written to this
+    // pool, so its size, its high-water mark and its counters are all zero and
+    // its ceiling is the default -- no dead stack frame produces that.
+    //
+    // Safe to search for: every value in `buffer` is a number or a bool, so
+    // there is no nested object here for a key of the same name to hide behind.
+    var want: [64]u8 = undefined;
+    for ([_][]const u8{ "length", "used", "allocated", "reads", "writes" }) |k| {
+        const zero = try std.fmt.bufPrint(&want, "\"{s}\":0,", .{k});
+        testing.expect(std.mem.indexOf(u8, obj, zero) != null) catch |e| {
+            std.debug.print("\n  expected \"{s}\" to be 0 in:\n  {s}\n", .{ k, obj });
+            return e;
+        };
+    }
+    const ceiling = try std.fmt.bufPrint(&want, "\"ceiling\":{d},", .{pool_mod.DEFAULT_CAPACITY});
+    try testing.expect(std.mem.indexOf(u8, obj, ceiling) != null);
 }
 
 test "a HEAD connection carries no phantom body and is closed after it" {
