@@ -13,6 +13,32 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+// Whether the engine's pool mutex can be taken right now.
+//
+// The engine and the ICD need this mutex for every transfer and give up after
+// a bounded wait, so an allocator that holds it from its first allocation to
+// process exit starves the very thing that owns the pool -- for the whole of a
+// generation, while owning nothing. That is not observable from inside the
+// allocator, which always believes it holds the lock, so it is asked here
+// instead: with nothing mapped out of the pool, taking the mutex must succeed.
+//
+// Fails for an unrelated reason if some other process happens to hold it; the
+// suite is meant to run with the pool to itself.
+static int pool_lock_is_free(void) {
+    HANDLE h = CreateMutexW(NULL, FALSE, L"Local\\DPU.pool.lock");
+    if (h == NULL) return 0;
+    const DWORD wr = WaitForSingleObject(h, 0);
+    const int ok = (wr == WAIT_OBJECT_0 || wr == WAIT_ABANDONED);
+    if (ok) ReleaseMutex(h);
+    CloseHandle(h);
+    return ok;
+}
+#endif
+
 #include "ggml-dpu.h"
 
 static int checks = 0;
@@ -83,8 +109,37 @@ int main(void) {
         return 1;
     }
 
-    check((a + 64 * MiB) <= b || (b + 32 * MiB) <= a,
-          "two live blocks do not overlap");
+    // Overlap has to be checked on the pool FILE offsets. `a` and `b` are
+    // separate mappings, so comparing the pointers with <= is undefined
+    // behaviour, and disjoint addresses say nothing about whether the two
+    // blocks reserved overlapping bytes in pool.vram.
+    {
+        size_t ao = 0, al = 0, bo = 0, bl = 0;
+        check(ggml_dpu_block_span(a, &ao, &al) == 1, "block a reports its pool offset");
+        check(ggml_dpu_block_span(b, &bo, &bl) == 1, "block b reports its pool offset");
+        const int disjoint = (ao + al <= bo) || (bo + bl <= ao);
+        check(disjoint, "two live blocks occupy disjoint byte ranges in the pool file");
+    }
+
+    // A size that is not a whole number of MiB is the case that matters for
+    // mapping alignment: rounding to the 4 KiB page size leaves the next offset
+    // at a boundary MapViewOfFile rejects, and the request after it fails even
+    // though the pool is nearly empty. Both allocations below must be served.
+    {
+        unsigned char * d = (unsigned char *) ggml_dpu_malloc(5 * MiB + 4096u);
+        check(d != NULL, "a 5 MiB + 4 KiB request is served");
+        unsigned char * e = (unsigned char *) ggml_dpu_malloc(4 * MiB);
+        check(e != NULL, "the request after a non-MiB-sized one is served (mapping alignment)");
+        if (d != NULL) {
+            size_t o = 0;
+            check(ggml_dpu_block_span(d, &o, NULL) == 1 && (o % (64u * 1024u)) == 0,
+                  "a block of an odd size still lands on a 64 KiB boundary");
+            fill(d, 5 * MiB + 4096u, 23);
+            check(verify(d, 5 * MiB + 4096u, 23), "the odd-sized block reads back intact");
+            ggml_dpu_free(d);
+        }
+        if (e != NULL) ggml_dpu_free(e);
+    }
 
     fill(a, 64 * MiB, 7);
     fill(b, 32 * MiB, 199);
@@ -112,6 +167,10 @@ int main(void) {
     }
 
     check(ggml_dpu_pool_bytes() == 0, "the pool is empty again at the end");
+#ifdef _WIN32
+    check(pool_lock_is_free(),
+          "the engine's pool lock is released once nothing is mapped from the pool");
+#endif
 
     printf("\n%d/%d checks passed\n", checks - fails, checks);
     return fails == 0 ? 0 : 1;

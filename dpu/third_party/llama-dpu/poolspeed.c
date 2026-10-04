@@ -61,23 +61,26 @@ int main(int argc, char **argv) {
 
         // Read it back, warm. This is the shape of every token: re-reading
         // weights that are already resident.
+        //
+        // Every byte is read, not one per page. A per-page probe measures how
+        // fast the CPU walks a page table, not how fast bytes arrive, and
+        // dividing the full length by that time reports a rate with no
+        // relationship to a real read -- which is exactly what an earlier
+        // version of this file did.
         double t2 = now();
-        volatile unsigned long long sum = 0;
-        for (size_t i = 0; i < n; i += 4096) sum += (unsigned char)p[i];
+        unsigned long long sum = 0;
+        for (size_t i = 0; i < n; i++) sum += (unsigned char)p[i];
         double t3 = now();
         banner("pool     + warm read", t3 - t2, n);
         if (sum == 12345) printf("(never printed)\n");
 
-        // And cold: force the pages out from under the mapping and read again.
-        {
-            DWORD len = 256 * 1024 * 1024;
-            VirtualAlloc(p, len, MEM_RESET, PAGE_READWRITE);
-            double t4 = now();
-            for (size_t i = 0; i < len; i += 4096) sum += (unsigned char)p[i];
-            double t5 = now();
-            banner("pool + cold read (reset)", t5 - t4, len);
-            if (sum == 12345) printf("(never printed)\n");
-        }
+        // A cold read is deliberately NOT measured here. MEM_RESET does not
+        // apply to a file-backed view, and a user-mode program has no portable
+        // way to evict its own file-backed pages from the system cache. An
+        // earlier version called VirtualAlloc(MEM_RESET) here and got a number
+        // of several hundred GB/s, which was the still-warm mapping being read
+        // again. Printing the warm rate under a cold label would be worse than
+        // printing nothing.
 
         ggml_dpu_free(p);
     }

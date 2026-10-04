@@ -37,8 +37,6 @@
 #define NOMINMAX
 #endif
 
-#include <windows.h>
-
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,7 +44,12 @@
 
 #include "ggml-dpu.h"
 
+// windows.h is included under its own guard, not before it. The non-Windows
+// stubs at the foot of this file are only reachable if the rest of the file
+// parses, and on Linux or macOS an unguarded <windows.h> is a hard error that
+// stops the build before the stubs ever matter.
 #if defined(_WIN32)
+#include <windows.h>
 
 // The engine publishes the tier it granted in this file, and the ICD reads the
 // same one. It is the authority on how large the pool may be; inventing a
@@ -64,8 +67,15 @@
 // path is both faster and perfectly correct. The pool is for tensors.
 #define DPU_MIN_ALLOC   (4u * 1024u * 1024u)
 
-// The pool file is a Windows file and is addressed in 4 KiB pages.
-#define DPU_GRAN        4096ull
+// The pool is mapped, not paged by hand, and MapViewOfFile rejects any offset
+// that is not a multiple of the SYSTEM ALLOCATION GRANULARITY -- 64 KiB on
+// x86-64, sixteen times the 4 KiB page size. Rounding to the page size is
+// therefore wrong the moment an allocation is not a whole number of MiB: a
+// 4 MiB + 4 KiB request leaves the next offset 4 KiB-aligned, the following
+// MapViewOfFile fails, and that allocation silently falls back to the heap
+// while the pool still has room. 64 KiB satisfies both the mapping and the
+// allocator's own 64-byte alignment requirement.
+#define DPU_GRAN        0x10000ull
 
 // How long to wait for the engine to let go of the pool before giving up and
 // serving everything from malloc. Waiting is better than failing: the engine is
@@ -226,19 +236,10 @@ static int dpu_init(void) {
         return 0;
     }
 
-    g_lock = CreateMutexW(NULL, FALSE, L"Local\\DPU.pool.lock");
-    if (g_lock == NULL) {
-        fprintf(stderr, "ggml-dpu: could not create the pool lock, serving from malloc\n");
-        return 0;
-    }
-    const DWORD wr = WaitForSingleObject(g_lock, DPU_LOCK_WAIT_MS);
-    if (wr != WAIT_OBJECT_0 && wr != WAIT_ABANDONED) {
-        fprintf(stderr, "ggml-dpu: another process owns the pool, serving from malloc\n");
-        CloseHandle(g_lock);
-        g_lock = NULL;
-        return 0;
-    }
-    // WAIT_ABANDONED means the previous owner died holding it; we now own it.
+    // The pool lock is NOT taken here. It is taken by the first allocation and
+    // dropped by the last free, so that this process does not hold the engine's
+    // mutex for the whole of a long inference while owning nothing in the pool.
+    // See dpu_lock_acquire.
 
     g_file = CreateFileW(
         L"P:\\DPU\\pool.vram",
@@ -247,7 +248,7 @@ static int dpu_init(void) {
         NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (g_file == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "ggml-dpu: cannot open %s, serving from malloc\n", DPU_POOL_PATH);
-        goto unlock;
+        return 0;
     }
 
     // The pool file is sparse and is never preallocated -- it grows as it is
@@ -299,11 +300,42 @@ unmap:
 close_file:
     CloseHandle(g_file);
     g_file = INVALID_HANDLE_VALUE;
-unlock:
+    return 0;
+}
+
+// Take the engine's pool mutex, so no other writer can hand out offsets into
+// the same file while this process holds any of them.
+//
+// Deliberately not held for the process lifetime. The engine and the ICD need
+// this mutex for every transfer and give up after a bounded wait, so a run that
+// holds it from the first allocation to process exit starves them for the whole
+// generation - minutes of 30-second timeouts for a pool nobody is using. It is
+// held exactly while g_nblocks is non-zero, which is the window in which this
+// process has actually reserved offsets.
+//
+// Returns 0 if the pool is already taken; the caller then serves from malloc.
+static int dpu_lock_acquire(void) {
+    if (g_lock != NULL) return 1;
+
+    HANDLE h = CreateMutexW(NULL, FALSE, L"Local\\DPU.pool.lock");
+    if (h == NULL) return 0;
+
+    const DWORD wr = WaitForSingleObject(h, DPU_LOCK_WAIT_MS);
+    if (wr != WAIT_OBJECT_0 && wr != WAIT_ABANDONED) {
+        CloseHandle(h);
+        return 0;
+    }
+    // WAIT_ABANDONED means the previous owner died holding it; we now own it.
+    g_lock = h;
+    return 1;
+}
+
+// Drop the pool mutex once this process holds nothing in the pool.
+static void dpu_lock_release(void) {
+    if (g_lock == NULL) return;
     ReleaseMutex(g_lock);
     CloseHandle(g_lock);
     g_lock = NULL;
-    return 0;
 }
 
 void * ggml_dpu_malloc(size_t size) {
@@ -311,6 +343,11 @@ void * ggml_dpu_malloc(size_t size) {
 
     dpu_enter();
     if (!dpu_init()) { dpu_leave(); return NULL; }
+    if (!dpu_lock_acquire()) {
+        fprintf(stderr, "ggml-dpu: another process owns the pool, serving from malloc\n");
+        dpu_leave();
+        return NULL;
+    }
 
     const uint64_t need = ((uint64_t) size + DPU_GRAN - 1) / DPU_GRAN * DPU_GRAN;
 
@@ -347,7 +384,13 @@ void * ggml_dpu_malloc(size_t size) {
     g_free[idx].off = e.off + need;
     g_free[idx].len = e.len - need;
     if (g_free[idx].len == 0) {
-        g_free[idx] = g_free[g_nfree - 1];
+        // Remove the entry in place. Swapping the last element into idx would
+        // leave the list unsorted, and dpu_extent_release merges neighbours on
+        // the assumption that it is sorted by offset -- so two adjacent extents
+        // would stop merging and the pool would fragment into unusable slivers
+        // while a large request fell back to malloc.
+        memmove(&g_free[idx], &g_free[idx + 1],
+                (g_nfree - idx - 1) * sizeof(dpu_extent));
         g_nfree--;
     }
 
@@ -386,8 +429,34 @@ int ggml_dpu_free(void * ptr) {
     g_n_free++;
     if (g_nfree > g_max_free) g_max_free = g_nfree;
 
+    // The last reservation in the pool is gone, so nothing in the pool is ours
+    // and the engine's mutex can go back. Held for the whole generation this was
+    // the bug that made the pool unusable by the very thing that owns it.
+    if (g_nblocks == 0) {
+        dpu_lock_release();
+    }
+
     dpu_leave();
     return 1;
+}
+
+int ggml_dpu_block_span(const void * ptr, size_t * offset, size_t * length) {
+    if (ptr == NULL) return 0;
+
+    dpu_enter();
+    if (g_state != 1) { dpu_leave(); return 0; }
+
+    int found = 0;
+    for (size_t i = 0; i < g_nblocks; i++) {
+        if (g_blocks[i].base == ptr) {
+            if (offset != NULL) *offset = (size_t) g_blocks[i].off;
+            if (length != NULL) *length = (size_t) g_blocks[i].len;
+            found = 1;
+            break;
+        }
+    }
+    dpu_leave();
+    return found;
 }
 
 size_t ggml_dpu_pool_bytes(void) {
@@ -404,6 +473,9 @@ size_t ggml_dpu_pool_bytes(void) {
 // conditional compilation of its own beyond the one guard it already has.
 void * ggml_dpu_malloc(size_t size)          { (void) size; return NULL; }
 int    ggml_dpu_free (void * ptr)           { (void) ptr;  return 0;    }
-size_t ggml_dpu_pool_bytes(void)            { return 0; }
+size_t ggml_dpu_pool_bytes(void)            { return 0;    }
+int    ggml_dpu_block_span(const void * ptr, size_t * o, size_t * l) {
+    (void) ptr; (void) o; (void) l; return 0;
+}
 
 #endif // _WIN32

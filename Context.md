@@ -502,10 +502,11 @@ Peak commit fell by 619 MB on the 3B and 1684 MB on the 9B -- not the 1.87 GB /
 went from 31 s to **9.2 hours**. The allocator is not the reason.
 `GGML_DPU_STATS=1` shows the one large allocation (the weight buffer) served
 from the pool, with all 1246 graph temporaries correctly below the 4 MiB
-threshold and left to `malloc`; and `poolspeed` writes **884 MB/s** through a
-2 GiB pool mapping against 949 MB/s for a plain `dd` write to `P:`, so neither
-the code nor the device is the bottleneck. Task Manager shows the run pegged at
-100% disk, which is the same fact from the other side.
+threshold and left to `malloc`; and `poolspeed` writes **1428 MB/s** through a
+2 GiB pool mapping and reads every byte of it back at **3942 MB/s** warm,
+against 949 MB/s for a plain `dd` write to `P:`, so neither the code nor the
+device is the bottleneck. Task Manager shows the run pegged at 100% disk,
+which is the same fact from the other side.
 
 The reason is that **file-backed does not mean free**. Mapping the pool is
 charged to the page cache rather than to commit, and the counters show it -- but
@@ -522,7 +523,7 @@ where the bytes are filed: a stock CPU-only llama.cpp with no DPU at all already
 does 7.54 tok/s on the 3B and 2.51 tok/s on the 9B.
 
 The code is kept because the measurement is reusable and `dputest` is a real
-test -- 14/14 with the pool on, 3/3 with it off -- not because it is the route
+test -- 21/21 with the pool on, 3/3 with it off -- not because it is the route
 to an 8B model. The route to one is a compute path the ICD does not have: of the
 fourteen entry points a Vulkan compute client needs,
 `vkCreateShaderModule` and `vkCreateComputePipelines` are present and refused,

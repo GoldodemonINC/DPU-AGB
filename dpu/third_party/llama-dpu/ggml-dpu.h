@@ -27,6 +27,16 @@ int ggml_dpu_free(void * ptr);
 // Bytes currently mapped out of the pool, or 0 when the pool is not in use.
 size_t ggml_dpu_pool_bytes(void);
 
+// The pool-file byte range backing `ptr`, written through `offset`/`length`.
+// Returns 1 if the pointer came from the pool, 0 if it did not.
+//
+// Exists so a test can assert that two live blocks occupy disjoint byte ranges
+// in the FILE. The returned pointers cannot answer that: they are separate
+// mappings, so ordering them with `<=` is undefined behaviour, and two blocks
+// may be disjoint in memory while sharing a range on disk. Only the offsets
+// say what was actually reserved.
+int ggml_dpu_block_span(const void * ptr, size_t * offset, size_t * length);
+
 #ifdef __cplusplus
 }
 #endif

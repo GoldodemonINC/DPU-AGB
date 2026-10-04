@@ -39,8 +39,11 @@ mode — absent, locked by another process, exhausted, too small — falls back 
 No Vulkan SDK is needed for any of this.
 
 ```sh
-git clone --depth 1 https://github.com/ggml-org/llama.cpp
+git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
+# Pinned: the patches and every number below are for this revision. Cloning the
+# default branch and applying them reproduces nothing once upstream moves.
+git checkout 0504396
 patch -p1 < .../0001-hooks.patch
 patch -p1 < .../0002-allocator.patch
 
@@ -57,7 +60,7 @@ cp /a/toolchain/mingw64/bin/lib{gcc_s_seh-1,gomp-1,stdc++-6,winpthread-1}.dll bu
 
 ```sh
 # correctness, both modes
-GGML_DPU_POOL=1 ./dputest      # 14/14
+GGML_DPU_POOL=1 ./dputest      # 21/21
 ./dputest                      # pool off: declines everything, by design
 ```
 
@@ -87,9 +90,11 @@ The mechanism works, and it is not fast:
   `GGML_DPU_STATS=1` shows the **one** large allocation — the weight buffer —
   served from the pool, with all 1246 graph temporaries correctly below the
   4 MiB threshold and served by `malloc`;
-- the allocator is not the slow part: `poolspeed` writes **884 MB/s** through a
-  2 GiB pool mapping and reads it back at **50 GB/s** warm, against 949 MB/s for
-  a plain `dd` write to `P:` — the device is not the bottleneck;
+- the allocator is not the slow part: `poolspeed` writes **1428 MB/s** through a
+  2 GiB pool mapping and reads every byte of it back at **3942 MB/s** warm,
+  against 949 MB/s for a plain `dd` write to `P:` — the device is not the
+  bottleneck. Both figures move by a few hundred MB/s between runs on this
+  box; a single run is not a benchmark;
 - the pool file stays sparse: 8 GiB logical, **0.00 GB allocated** after the
   allocator test.
 
@@ -97,6 +102,14 @@ And it does not buy the thing it was for. Peak commit fell by **619 MB on the
 3B and 1684 MB on the 9B** — not the 1.87 GB / 5.76 GB of weights — while
 generation went **2.87x slower**, and at 9B the load collapsed from 31 s to
 **9.2 hours**.
+
+An earlier version of this file reported the warm read as 50 GB/s. That number
+was wrong: the loop sampled one byte per 4 KiB page and then divided the *whole*
+length by the elapsed time, so it measured page-table walking, not reads.
+Reading every byte gives 3942 MB/s. The cold case was removed rather than
+corrected — `MEM_RESET` does not apply to a file-backed view, and a user-mode
+program cannot evict its own file-backed pages, so the "cold read" it printed
+was the still-warm mapping read again.
 
 ## Why, which is the part worth keeping
 
