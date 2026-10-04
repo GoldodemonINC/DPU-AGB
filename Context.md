@@ -5,7 +5,7 @@ applications as a discrete GPU through a user-mode installable client driver.
 
 ## Status at this commit
 
-`zig build check` — **110/110 tests**, exit 0, `zig fmt --check` clean. The gate
+`zig build check` — **111/111 tests**, exit 0, `zig fmt --check` clean. The gate
 also builds `dpu.exe`, so a green run now means the shipping binary compiles.
 
 `zig build probe` — **50/50, exit 0**, closing with
@@ -29,17 +29,23 @@ is worse than no number.
 | `5fce630` | #3 | Stop dividing a measurement by a hardcoded constant |
 | `2225369` | #4 | Let the router pick the status, so a miss cannot answer 200 |
 | `caa8ab6` | — | Correct the merge-history table in Context.md |
+| `08d78e5` | #8 | Union of #5 + #6 + #7, and `serveOnce` split into a pure router |
+| `de4be68` | #9 | Split the wire suite into a harness and a contract |
+| `d2ba409` | #10 | Split server.zig by what changes together, and move its tests out |
 
-This branch is stacked on **#8**, which is itself the union of three still-open
-PRs, none of which is merged:
+Every one of #5 to #10 is still open and none is merged. The stack is linear:
 
 - **#5** `fix/check-must-build-the-exe` — the gate now builds the executable.
 - **#6** `fix/malformed-request-400` — 400 for a request line that is not one.
 - **#7** `fix/head-response-no-body` — no body on a HEAD response.
+- **#8** `integrate/gate-400-and-head` — the union of those three, plus the
+  router split that #9 and #10 both sit on.
+- **#9** `test/wire-conformance` — the wire-level suite.
+- **#10** `refactor/split-server` — the production server, split the same way.
 
-On top of that, this branch adds the wire-level suite described below. It cannot
-be merged before #8, and it exists only because #5, #6 and #7 are all claims
-about HTTP behaviour that nothing in the repository was checking.
+This branch is stacked on all three of #8, #9 and #10 and cannot merge before
+any of them. What it adds is small: a scratch pool for the wire suite, and the
+one assertion that pool makes possible.
 
 PR #1 merged at 2026-10-03T18:06:35Z by the `Goldodemon-Automation` credential
 while a task was mid-run on another branch; PR #2 was merged immediately when
@@ -235,6 +241,62 @@ vacuously true — so the asset test asserts `ASSETS.len >= 3` first.
 The tables that *are* written out are genuinely test data: the matrix includes
 paths that must **not** route, so it cannot be derived from the router.
 
+### The `buffer` object is covered now, with a pool of the test's own
+
+The `buffer` object is the largest part of the telemetry document and it is
+`null` unless the capacity pool is open. The gate deliberately runs without one
+so it never touches `P:\DPU\pool.vram`, so all sixteen of its fields — half the
+document — were invisible to `zig build check` and were checked against a
+running engine instead. That is a weaker guarantee wearing the same clothes as
+a strong one, which is the exact defect #5 was opened for narrowed to one
+object.
+
+The harness now opens a scratch pool: `P:\DPU-wirepool`, created with
+`CreateDirectoryW` after a `RemoveDirectoryW` so a crashed run cannot make every
+later run fail, opened at `DEFAULT_CAPACITY` so `ceiling` reads the way it does
+in production. Nothing is preallocated and the test never writes, so the file
+stays at zero length — the 8 GiB is a limit, not a reservation — and `P:\` is
+already a requirement the backend suite imposes, so this adds no environmental
+demand the gate did not already carry.
+
+Four things about it are deliberate:
+
+**It fails loudly.** A telemetry document without a pool says `"buffer":null`.
+Every field assertion would then be skipped and the test would report success
+for having checked nothing. `error.BufferIsNull` is the opposite outcome, and it
+prints the whole document so the cause is visible.
+
+**It cannot share a file with the block device tests.** `P:\DPU-selftest` is
+written to by `blockdev`'s own tests; a pool that shares one would race them.
+`P:\DPU-wirepool` is separate, and `P:\DPU\pool.vram` is never opened.
+
+**`Scratch.detach` unlinks the file and removes the directory.** `Pool` did not
+surface `BlockDevice.destroy`, which already existed for exactly this and
+documents why it is dangerous; reaching past `Pool` into `dev` was the only
+alternative. Both are now behind one `detach` that a test cannot half-do.
+
+**The caller supplies the storage.** The first version of `openScratchPool`
+built the pool in a local, handed `h.ctx.pool` that local's address, and
+returned the pool *by value*. The context was left pointing into a stack frame
+that had already returned. Every one of the sixteen keys was still present —
+a `Pool` read through a dead pointer serialises into a perfectly well-formed
+object — and every value was garbage: `"ceiling":48`,
+`"length":140699779393448`. The key assertions could not see it at all.
+
+So the test also asserts five zero counters and the ceiling. With the storage
+fixed the object reads:
+
+```json
+{"ceiling":8589934592,"length":0,"used":0,"allocated":0,"saturation":0.000,
+ "readBps":0,"writeBps":0,"latencyMs":0.000,"reads":0,"writes":0,"sparse":true,
+ "tierRequested":8589934592,"tierGranted":8589934592,"tierClamped":false,
+ "tierStarved":false,"volumeFree":13284679680}
+```
+
+A stale frame cannot produce that. The value search is safe here in a way the
+`total` search was not: every value inside `buffer` is a number or a bool, so
+there is no nested object for a same-named key to hide behind.
+
 ### It costs one server, not ten
 
 `serveOnce` blocks in `accept` until a client arrives, so driving it needs a
@@ -257,9 +319,24 @@ binary with no wire suite:
 
 On an idle machine the suite is **not measurable** — all three builds land
 inside each other's spread. Under load the same measurement gave 83–93 ms for
-the 62-test build. Either way it is well under a tenth of a second, and the
-suite runs ~100 exchanges against a ~800 ms binary whose time is dominated by
+the 62-test build. Either way it is well under a tenth of a second, andthe suite runs ~100 exchanges against a ~800 ms binary whose time is dominated by
 the block-device integration tests.
+
+Opening a scratch pool is not free — it creates a file, marks it sparse through
+an `fsutil` spawn, and hands back a handle — so the 64-test build was timed
+against the 63-test build it sits on, twenty-five alternating runs each, on the
+committed content:
+
+| Build | min | p25 | median | p75 | mean |
+|---|---|---|---|---|---|
+| 63 tests, no scratch pool | 1776 ms | 1939 ms | 2150 ms | 2278 ms | 2163 ms |
+| 64 tests, scratch pool | 1754 ms | 2045 ms | 2229 ms | 2376 ms | 2278 ms |
+| delta | −22 ms | +106 ms | +79 ms | +98 ms | +115 ms |
+
+About **+0.1 s**, roughly 5% of the binary, inside a run-to-run spread several
+times that size — the minima are indistinguishable. Fifty runs, fifty exits of
+zero, so the pool open is not flaky either. That is the whole price of closing
+the gap, and it is cheap enough not to be a reason to leave the gap open.
 
 One trap worth naming, because it hung the first version of this file:
 `serveOnce` takes no socket — it serves whichever connection is next in the
@@ -279,10 +356,20 @@ reverted:
 | `respond` always writes the body, ignoring `framing` | `CHECK_EXIT=1` — the two HEAD tests and the phantom-body test all failed; the first with `expected 0, found 5744`. **All 21 unit tests still passed.** |
 | a miss answers `200 OK` instead of `404 Not Found` | `CHECK_EXIT=1` — the wire matrix failed, alongside five unit tests that already covered the same claim |
 | the top-level `total` object deleted from the serializer | `CHECK_EXIT=1` — `telemetry has no top-level key total; top-level keys are: t uptimeMs engine counters pool procs buffer` |
+| the `latencyMs` field deleted from the `buffer` object | `CHECK_EXIT=1` — `buffer has no field latencyMs`, with the fifteen surviving names listed. `110/111` |
+| the scratch pool opened but never attached to the harness | `CHECK_EXIT=1` — `buffer is null: the scratch pool did not attach`. `110/111` |
 | `serveAsset` re-decides framing instead of trusting the `Decision` | `CHECK_EXIT=1` — the asset-HEAD test and the phantom-body test failed. A handler reaching back across the module boundary to re-derive a fact the router already decided |
 
 The first is the point of the file. That regression is invisible to every test
 above the socket, and it is exactly the defect #7 exists to remove.
+
+The fifth is the one that keeps the fourth honest. Every field assertion in the
+`buffer` test sits behind the pool being open, so a harness that opened a pool
+and then forgot to attach it would skip the lot and report success for having
+checked nothing — the tautology this suite has already produced once. The test
+returns `error.BufferIsNull` instead, and that path was proven by deleting the
+attach line and watching the gate go red, rather than being trusted because it
+reads that way.
 
 The third one is worth keeping for a different reason: **the first version of
 that test did not catch it.** It searched the document for the substring
@@ -291,7 +378,10 @@ assertion passed with the top-level `total` deleted. The test was a tautology
 and the only reason anyone knows is that the injected mistake was run against
 it and the gate stayed green. It now walks the bytes tracking brace depth and
 reports only names at the object's own level — which is what makes "the key is
-present" mean present *there* rather than present somewhere.
+present" mean present *there* rather than present somewhere. The `buffer` test
+uses the same walker on the `buffer` object rather than a hand-copied key list,
+and asserts `BUFFER_FIELDS.len == keys.len` so an object that grew a field would
+also fail rather than pass unnoticed.
 
 ## The loader/ICD handle contract, as measured
 
@@ -397,11 +487,11 @@ a handler that forgets to thread it.
    that takes a body, no keep-alive, and no concurrent client. Each of those is
    a claim someone will eventually make, and the suite should already be red when
    they start.
-6. **Cover the `buffer` object in the gate.** The telemetry shape test asserts
-   the eight top-level keys and the three `engine` keys, but the sixteen
-   `buffer` fields are only emitted when the capacity pool is open, and the gate
-   deliberately runs without one. They are checked against a running engine, which
-   is weaker than a gate check. A scratch pool on a test volume would close it.
+6. **Assert the `buffer` values, not just its keys — on the write path.** The
+   sixteen fields are now covered with a pool open, but that pool is fresh and
+   never written to, so every counter it reports is a zero. The same test with a
+   pool that has actually absorbed and read back blocks would cover the sampler
+   arithmetic, which nothing in the gate touches today.
 
 ## Running things
 
@@ -426,6 +516,13 @@ The engine binds `127.0.0.1:8787` and serves **one connection at a time**, so
 issue requests sequentially or they will queue behind each other. `P:\` is
 optional: `Pool.init` failure degrades telemetry to `"buffer":null` and the server
 still starts.
+
+The gate's wire suite needs `P:\` for the one test that opens a scratch pool,
+and it creates and removes `P:\DPU-wirepool` itself. Verified after 50 runs and
+a probe: the directory is gone, `P:\DPU\pool.vram` is byte-for-byte unchanged
+(same mtime, same size) across a test binary, and no `test.exe`, `dpu.exe` or
+`fsutil.exe` outlives the run. `zig build probe` *does* write to the live pool —
+that is what it is for, and `src/backend/icd/probe.zig` hardcodes the path.
 
 `zig build bench` **destroys `P:\DPU\pool.vram`** — it sweeps an 8 GiB working set
 through it and unlinks the file afterwards. The engine recreates it on next start.

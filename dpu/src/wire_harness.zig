@@ -36,6 +36,7 @@ const std = @import("std");
 const testing = std.testing;
 const win = @import("win");
 const telemetry = @import("telemetry.zig");
+const pool_mod = @import("pool.zig");
 const server = @import("server.zig");
 const server_context = @import("server/context.zig");
 
@@ -212,6 +213,32 @@ pub const Harness = struct {
         return s;
     }
 
+    /// Open a scratch capacity pool into `scratch` and attach it to this harness.
+    ///
+    /// The caller supplies the storage deliberately. `h.ctx.pool` has to keep
+    /// pointing at the same live object for the whole test, so the pool cannot
+    /// be built in one frame and returned by value into another — that leaves
+    /// the context holding the address of a frame that has already returned.
+    ///
+    /// Fails loudly if the pool cannot be opened — no fallback to a pool-less
+    /// document. A telemetry document without a pool says `"buffer":null`,
+    /// which would make every assertion about the buffer object's fields pass
+    /// vacuously, and a test that passes for the wrong reason is worse than no
+    /// test.
+    pub fn openScratchPool(self: *Harness, scratch: *Scratch) !void {
+        const dir = try makeScratchDir();
+        errdefer removeDir(dir);
+
+        // `DEFAULT_CAPACITY` so `ceiling` reads the way it does in production.
+        // Nothing is preallocated and this path never writes, so the file stays
+        // at zero length: the 8 GiB is a limit, not a reservation.
+        scratch.* = .{
+            .pool = try pool_mod.Pool.init(std.heap.page_allocator, SCRATCH_VOLUME, dir, pool_mod.DEFAULT_CAPACITY),
+            .dir = dir,
+        };
+        self.ctx.pool = &scratch.pool;
+    }
+
     fn exchange(self: *Harness, payload: []const u8, label: []const u8) !Response {
         const s = try self.dispatch(payload);
         defer close(s);
@@ -281,6 +308,60 @@ pub fn harness() !*Harness {
 }
 
 var shared: ?*Harness = null;
+
+/// Where a scratch capacity pool is opened.
+///
+/// Same volume as the backend suite's scratch pool, deliberately: the gate
+/// already requires `P:\` to exist, so putting it here adds no environmental
+/// requirement the gate did not already have. A different directory from
+/// `DPU-selftest` because that pool is written to by the block device tests and
+/// this one must not share a file with them.
+const SCRATCH_DIR = "P:\\DPU-wirepool";
+const SCRATCH_VOLUME = "P:\\";
+
+/// A scratch capacity pool attached to the harness for the length of one test.
+///
+/// Owns the directory and the pool file inside it. `detach` unlinks the file,
+/// removes the directory and stops the harness reporting a pool, so a test
+/// cannot leave either behind — the failure mode `BlockDevice.destroy` was
+/// written to prevent.
+pub const Scratch = struct {
+    pool: pool_mod.Pool,
+    dir: []const u8,
+
+    pub fn detach(self: *Scratch, h: *Harness) void {
+        // Stop the context pointing at it before the pool is torn down, so
+        // nothing can read a destroyed device.
+        h.ctx.pool = null;
+        self.pool.destroy();
+        removeDir(self.dir);
+        std.heap.page_allocator.free(self.dir);
+    }
+};
+
+/// Create the scratch pool directory, clearing any residue from a crashed run.
+fn makeScratchDir() ![]const u8 {
+    const dir = try std.fmt.allocPrint(std.heap.page_allocator, SCRATCH_DIR, .{});
+    errdefer std.heap.page_allocator.free(dir);
+    const wide = try std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, dir);
+    defer std.heap.page_allocator.free(wide);
+    // Remove any residue from a previous run before creating, so a crash
+    // cannot make every later run fail.
+    _ = c.RemoveDirectoryW(wide.ptr);
+    if (c.CreateDirectoryW(wide.ptr, null) == 0) {
+        if (c.GetLastError() != c.ERROR_ALREADY_EXISTS) return error.ScratchDirFailed;
+    }
+    return dir;
+}
+
+fn removeDir(dir: []const u8) void {
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, dir) catch return;
+    defer std.heap.page_allocator.free(wide);
+    // Only the empty directory: the pool file inside it was unlinked by
+    // `Pool.destroy`, and anything else here would be a bug worth leaving
+    // visible rather than deleting.
+    _ = c.RemoveDirectoryW(wide.ptr);
+}
 
 /// Ask the OS which port the listener actually got.
 fn boundPort(fd: c.SOCKET) !u16 {

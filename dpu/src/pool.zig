@@ -62,6 +62,16 @@ pub const Pool = struct {
         self.dev.deinit();
     }
 
+    /// Close and unlink the pool file. For scratch pools only — a real pool is
+    /// destroyed by unlinking it, and nothing here can undo that.
+    ///
+    /// `BlockDevice.destroy` already exists for exactly this and documents the
+    /// hazard; `Pool` simply did not surface it, so the only way to unlink a
+    /// pool reached through this type was to reach past it into `dev`.
+    pub fn destroy(self: *Pool) void {
+        self.dev.destroy();
+    }
+
     /// Read at an offset. Prefers the aligned path and falls back to the
     /// bouncing wrapper when the caller's buffer cannot satisfy it.
     pub fn read(self: *Pool, offset: u64, buf: []u8) !usize {
