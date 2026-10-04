@@ -19,8 +19,9 @@ test {
     // Same for the server's routing table. Without this the dashboard's tests
     // are dead code: `zig build test` only discovers tests in the root module
     // and its relative imports, and nothing else in the backend touches the
-    // HTTP layer.
-    _ = @import("server.zig");
+    // HTTP layer. The router's own assertions live beside it rather than
+    // inside it, so both have to be named here.
+    _ = @import("server/router_test.zig");
     // And for the wire-level suite, which drives the real server over loopback
     // sockets. server.zig's own tests stop at the function boundary: they say
     // a miss routes to a 404, never that a client receives one. The 200-for-a-
