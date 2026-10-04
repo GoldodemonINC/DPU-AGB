@@ -5,7 +5,7 @@ applications as a discrete GPU through a user-mode installable client driver.
 
 ## Status at this commit
 
-`zig build check` — **108/108 tests**, exit 0, `zig fmt --check` clean. The gate
+`zig build check` — **109/109 tests**, exit 0, `zig fmt --check` clean. The gate
 also builds `dpu.exe`, so a green run now means the shipping binary compiles.
 
 `zig build probe` — **50/50, exit 0**, closing with
@@ -127,12 +127,26 @@ second response.
 
 ## The HTTP surface is asserted on the wire, not just in the router
 
-`src/server_wire_test.zig` — nine tests that drive the real `Server` over
-loopback TCP and read the responses off a socket. They are part of the existing
-`zig build test` root, so `zig build check` runs them; there is no separate step
-to forget.
+Two files, split by what changes together:
 
-They exist because of a specific, measured gap. The twenty-one tests in
+| File | Owns | Knows about |
+|---|---|---|
+| `src/wire_harness.zig` | binding, connecting, dispatching, reading; the server fixture and its single listener | sockets, HTTP framing. Nothing about DPU's routes. |
+| `src/server_wire_test.zig` | the contract: which routes exist, what status each answers, what HEAD advertises | DPU. **No socket calls at all.** |
+
+The second row is the one worth enforcing. `server_wire_test.zig` imports only
+`std`, `wire_harness.zig` and `server.zig`; a grep for `socket`, `recv`, `send`,
+`connect`, `setsockopt` or `SOCKET` in it returns nothing. A reader asking "what
+does this server promise?" should not have to read a `setsockopt` to find out,
+and the split is only worth anything if it stays a fact rather than a habit.
+
+Callers get three verbs and never assemble a request by hand: `h.get(method,
+path)`, `h.post(path, body)` — which computes `Content-Length` rather than
+carrying a hand-counted literal beside it — and `h.raw(payload, label)` for the
+request lines that are not well-formed. `h.dispatch` returns the socket when a
+test needs to ask a question `readToEof` cannot answer.
+
+The tests exist because of a specific, measured gap. The twenty-one tests in
 `server.zig` call `route`, `routeRequest` and `framingFor` directly. None of them
 opens a socket, formats a status line, or compares a `Content-Length` against
 the bytes that actually followed it. So the assertion "a miss is 404" was, in
@@ -152,8 +166,9 @@ What the suite asserts, and why each one is not a restatement of the code:
 | a malformed line is 400 even when its target names no route | the malformed check runs before any route lookup: four shapes naming `/nope` answer the same 400 as the shapes that named nothing, so a client cannot use a malformed request to discover whether a path exists |
 | valid request lines that look unusual still route | #6 did not over-reach: a line with no trailing CRLF, and one with a leading space, still serve |
 | a control write is visible in the telemetry that follows it | POST `power=low`, then GET telemetry and find `"power":"LOW"` and `"prefetch":1` — the dashboard's own exchange, as a gate check rather than a demo |
-| HEAD advertises the length GET returns, and sends no bytes | same status, `Content-Length` equal to the length GET *actually returned*, body zero — on three assets, the second spelling of the dashboard, and two misses |
-| only HEAD suppresses the body | the negative case: every other verb still gets its body, so the HEAD result is not an artefact of everything being empty |
+| every asset answers HEAD with its GET length and no bytes | derived from `server.ASSETS`, not restated — see below |
+| HEAD on a miss is the miss, with no bytes | the same rule over paths that do not route: "no body" has to be a property of the response path, not of the asset table |
+| only HEAD suppresses the body | the negative case: every other verb still gets its body, so the HEAD results are not an artefact of everything being empty |
 | a HEAD connection carries no phantom body and is closed after it | reads the header block only, then requires **zero** further bytes, then requires a second request on that socket to get no response |
 
 The last one is the one no other test can be. A framing regression is invisible
@@ -162,7 +177,22 @@ write the body, and the bytes only become visible to whoever reads the socket
 next. The unit tests call `framingFor` and see a correct enum; only a socket can
 see that 5744 bytes arrived anyway.
 
-### It costs one server, not nine
+### Coverage is derived, not restated
+
+The asset tests iterate `server.ASSETS`, which is why `Asset` and `ASSETS` are
+`pub`. The first version carried a written-out list of asset paths, and that is
+a second thing that has to agree with the router — it would have stopped
+agreeing the day somebody added an asset, and nothing would have said so. This
+is the same failure mode #4 removed from the status code: two copies of one
+fact, one of which is only exercised when someone remembers.
+
+Derived coverage has the opposite hazard — an empty table makes the loop
+vacuously true — so the asset test asserts `ASSETS.len >= 3` first.
+
+The tables that *are* written out are genuinely test data: the matrix includes
+paths that must **not** route, so it cannot be derived from the router.
+
+### It costs one server, not ten
 
 `serveOnce` blocks in `accept` until a client arrives, so driving it needs a
 client on the other end. Binding a server per test would mean a `WSAStartup`, a
@@ -170,19 +200,31 @@ bind, a listen and a teardown per case — the slow way to learn nothing. Instea
 the harness holds one server bound to port 0 (so it can never collide with a
 running engine on 8787) and one `Context` for the life of the test binary, and
 each exchange is: connect, write, call `serveOnce`, read to EOF. `serveOnce`
-runs on the test's own thread, so there is no server thread, no shutdown race
+runs on the caller's own thread, so there is no server thread, no shutdown race
 and no accept timeout — the ordering is the caller's.
 
-Measured cost: **140 ms**, as the difference between the minimum of twelve
-alternating runs of the 61-test binary and the 52-test one without it. The
-suite's own time is dominated by the block-device integration tests.
+Measured as the minimum of fourteen alternating runs against the same 52-test
+binary with no wire suite:
+
+| Build | Total | Suite cost |
+|---|---|---|
+| quiet machine, 52 tests | 819 ms | — |
+| 61 tests, written-out asset list | 804 ms | below the noise floor |
+| 62 tests, derived asset list | 793 ms | below the noise floor |
+
+On an idle machine the suite is **not measurable** — all three builds land
+inside each other's spread. Under load the same measurement gave 83–93 ms for
+the 62-test build. Either way it is well under a tenth of a second, and the
+suite runs ~100 exchanges against a ~800 ms binary whose time is dominated by
+the block-device integration tests.
 
 One trap worth naming, because it hung the first version of this file:
 `serveOnce` takes no socket — it serves whichever connection is next in the
 accept backlog. A test that opens a connection and then lets something else
-serve blocks forever in the server's `recv`. The harness tracks whether a
-connection is queued and aborts loudly instead, so the mistake is a failed test
-rather than a hung gate.
+serve blocks forever in the server's `recv`. `dispatch` now does the
+connect/send/serve sequence in one place so it cannot be split, and the harness
+tracks whether a connection is queued and aborts loudly if `serve` is reached
+without one, so the mistake is a failed test rather than a hung gate.
 
 ### It has been shown to fail
 
@@ -191,7 +233,7 @@ reverted:
 
 | Regression injected | Result |
 |---|---|
-| `respond` always writes the body, ignoring `framing` | `CHECK_EXIT=1` — `HEAD advertises the length GET returns` failed with `expected 0, found 5744`, and the phantom-body test failed with it. **All 21 unit tests still passed.** |
+| `respond` always writes the body, ignoring `framing` | `CHECK_EXIT=1` — the two HEAD tests and the phantom-body test all failed; the first with `expected 0, found 5744`. **All 21 unit tests still passed.** |
 | a miss answers `200 OK` instead of `404 Not Found` | `CHECK_EXIT=1` — the wire matrix failed, alongside five unit tests that already covered the same claim |
 
 The first is the point of the file. That regression is invisible to every test
