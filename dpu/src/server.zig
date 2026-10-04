@@ -379,9 +379,13 @@ const style_css = assets.style_css;
 /// in the router and a second copy in the handler is how a path ends up routable
 /// but unservable, or served but unroutable -- two places that have to agree is
 /// the same failure this PR just removed from the status code.
-const Asset = struct { path: []const u8, mime: []const u8, body: []const u8 };
+pub const Asset = struct { path: []const u8, mime: []const u8, body: []const u8 };
 
-const ASSETS = [_]Asset{
+/// Public so the wire suite can derive its coverage from this table rather than
+/// keep a second copy of it. A written-out list of asset paths in a test is a
+/// second thing that has to agree with the router, and it stops agreeing the
+/// day somebody adds an asset here.
+pub const ASSETS = [_]Asset{
     .{ .path = "/", .mime = "text/html; charset=utf-8", .body = index_html },
     .{ .path = "/index.html", .mime = "text/html; charset=utf-8", .body = index_html },
     .{ .path = "/app.js", .mime = "application/javascript; charset=utf-8", .body = app_js },

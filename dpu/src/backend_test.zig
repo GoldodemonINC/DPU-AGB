@@ -21,6 +21,11 @@ test {
     // and its relative imports, and nothing else in the backend touches the
     // HTTP layer.
     _ = @import("server.zig");
+    // And for the wire-level suite, which drives the real server over loopback
+    // sockets. server.zig's own tests stop at the function boundary: they say
+    // a miss routes to a 404, never that a client receives one. The 200-for-a-
+    // miss bug shipped green through all of them.
+    _ = @import("server_wire_test.zig");
 }
 
 /// Scratch directory for the block device integration tests.
