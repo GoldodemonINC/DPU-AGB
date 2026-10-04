@@ -5,7 +5,7 @@ applications as a discrete GPU through a user-mode installable client driver.
 
 ## Status at this commit
 
-`zig build check` — **109/109 tests**, exit 0, `zig fmt --check` clean. The gate
+`zig build check` — **110/110 tests**, exit 0, `zig fmt --check` clean. The gate
 also builds `dpu.exe`, so a green run now means the shipping binary compiles.
 
 `zig build probe` — **50/50, exit 0**, closing with
@@ -135,10 +135,52 @@ Two files, split by what changes together:
 | `src/server_wire_test.zig` | the contract: which routes exist, what status each answers, what HEAD advertises | DPU. **No socket calls at all.** |
 
 The second row is the one worth enforcing. `server_wire_test.zig` imports only
-`std`, `wire_harness.zig` and `server.zig`; a grep for `socket`, `recv`, `send`,
-`connect`, `setsockopt` or `SOCKET` in it returns nothing. A reader asking "what
-does this server promise?" should not have to read a `setsockopt` to find out,
-and the split is only worth anything if it stays a fact rather than a habit.
+`std`, `wire_harness.zig` and `server/assets.zig`; a grep for `socket`, `recv`,
+`send`, `connect`, `setsockopt` or `SOCKET` in it returns nothing. A reader
+asking "what does this server promise?" should not have to read a `setsockopt`
+to find out, and the split is only worth anything if it stays a fact rather
+than a habit.
+
+### The production server is split the same way
+
+`server.zig` was 773 lines holding five things, and the audit graded it the
+weakest dimension for it. It is now six modules, split by what changes
+together rather than by size:
+
+| Module | Lines | Owns | Changes when |
+|---|---|---|---|
+| `src/server.zig` | 191 | bind, accept, recv, dispatch, `respond` | the wire format or socket handling changes |
+| `src/server/router.zig` | 183 | the pure decision: parse, route, framing | a route, status, verb rule or framing rule changes |
+| `src/server/telemetry_doc.zig` | 159 | the telemetry document | the JSON shape changes |
+| `src/server/context.zig` | 95 | `EngineState`, `PowerMode`, `Context` | the engine's modes change |
+| `src/server/assets.zig` | 44 | the one asset table | the dashboard's files change |
+| `src/server/router_test.zig` | 213 | the 21 unit tests | the router's contract changes |
+
+Three decisions inside that layout are worth stating, because each was a real
+choice rather than a default:
+
+**`router.zig` is pure.** It reads request bytes and returns a value. No socket,
+no clock, no engine state — and it imports no `win`. That is what makes the
+three facts a request line implies provably consistent: they come from one parse
+and travel together in a `Decision`, so there is no second read of the method
+to drift.
+
+**`Context` has its own module** rather than living in `server.zig`. The
+telemetry document needs to read it, and leaving it in the transport module
+would mean `server.zig` and `telemetry_doc.zig` import each other. A cycle is
+legal in Zig and would have worked; it would also have left "who owns engine
+state" ambiguous, which is the thing being fixed. One module, one owner, no
+cycle.
+
+**`respond` stayed in `server.zig`.** It is the only function that writes a
+status line, so "what code does this return" keeps one answer. Splitting the
+transport from the response format would have been tidier on paper and would
+have put the status line's owner somewhere nobody looks.
+
+The 21 unit tests moved to `router_test.zig` for the reason
+`server_wire_test.zig` exists: a test that sits next to the code it checks
+drifts toward restating it. `router.zig` is short enough to read in one go
+*because* twenty-one assertions are not interleaved with it.
 
 Callers get three verbs and never assemble a request by hand: `h.get(method,
 path)`, `h.post(path, body)` — which computes `Content-Length` rather than
@@ -166,9 +208,10 @@ What the suite asserts, and why each one is not a restatement of the code:
 | a malformed line is 400 even when its target names no route | the malformed check runs before any route lookup: four shapes naming `/nope` answer the same 400 as the shapes that named nothing, so a client cannot use a malformed request to discover whether a path exists |
 | valid request lines that look unusual still route | #6 did not over-reach: a line with no trailing CRLF, and one with a leading space, still serve |
 | a control write is visible in the telemetry that follows it | POST `power=low`, then GET telemetry and find `"power":"LOW"` and `"prefetch":1` — the dashboard's own exchange, as a gate check rather than a demo |
-| every asset answers HEAD with its GET length and no bytes | derived from `server.ASSETS`, not restated — see below |
+| every asset answers HEAD with its GET length and no bytes | derived from `assets.ASSETS`, not restated — see below |
 | HEAD on a miss is the miss, with no bytes | the same rule over paths that do not route: "no body" has to be a property of the response path, not of the asset table |
 | only HEAD suppresses the body | the negative case: every other verb still gets its body, so the HEAD results are not an artefact of everything being empty |
+| the telemetry document keeps every key the dashboard parses | the eight top-level keys and the three `engine` keys, read at their own JSON depth — every other assertion in the suite counts bytes, and a dropped field changes the length and nothing else |
 | a HEAD connection carries no phantom body and is closed after it | reads the header block only, then requires **zero** further bytes, then requires a second request on that socket to get no response |
 
 The last one is the one no other test can be. A framing regression is invisible
@@ -179,7 +222,7 @@ see that 5744 bytes arrived anyway.
 
 ### Coverage is derived, not restated
 
-The asset tests iterate `server.ASSETS`, which is why `Asset` and `ASSETS` are
+The asset tests iterate `assets.ASSETS`, which is why `Asset` and `ASSETS` are
 `pub`. The first version carried a written-out list of asset paths, and that is
 a second thing that has to agree with the router — it would have stopped
 agreeing the day somebody added an asset, and nothing would have said so. This
@@ -235,9 +278,20 @@ reverted:
 |---|---|
 | `respond` always writes the body, ignoring `framing` | `CHECK_EXIT=1` — the two HEAD tests and the phantom-body test all failed; the first with `expected 0, found 5744`. **All 21 unit tests still passed.** |
 | a miss answers `200 OK` instead of `404 Not Found` | `CHECK_EXIT=1` — the wire matrix failed, alongside five unit tests that already covered the same claim |
+| the top-level `total` object deleted from the serializer | `CHECK_EXIT=1` — `telemetry has no top-level key total; top-level keys are: t uptimeMs engine counters pool procs buffer` |
+| `serveAsset` re-decides framing instead of trusting the `Decision` | `CHECK_EXIT=1` — the asset-HEAD test and the phantom-body test failed. A handler reaching back across the module boundary to re-derive a fact the router already decided |
 
 The first is the point of the file. That regression is invisible to every test
 above the socket, and it is exactly the defect #7 exists to remove.
+
+The third one is worth keeping for a different reason: **the first version of
+that test did not catch it.** It searched the document for the substring
+`"total":`, and the `pool` object contains a `total` field of its own, so the
+assertion passed with the top-level `total` deleted. The test was a tautology
+and the only reason anyone knows is that the injected mistake was run against
+it and the gate stayed green. It now walks the bytes tracking brace depth and
+reports only names at the object's own level — which is what makes "the key is
+present" mean present *there* rather than present somewhere.
 
 ## The loader/ICD handle contract, as measured
 
@@ -333,20 +387,21 @@ a handler that forgets to thread it.
 2. **Multi-segment pool** — the tier resolver sums free space across roots and
    holds `RESERVE_BYTES` per volume (PR #1), but the pool is still a single file
    on a single volume, so nothing is gained on disk yet.
-3. **Split `server.zig`.** It is 769 lines holding Winsock transport, routing,
-   the telemetry document builder and asset serving. The telemetry serializer
-   belongs in its own file; a change to the document shape should not require
-   reading the router.
-4. **Process-level pool locking test** — existing tests prove a *thread* releases
+3. **Process-level pool locking test** — existing tests prove a *thread* releases
    `Local\DPU.pool.lock`; none proves two *processes* cannot corrupt `pool.vram`.
-5. **Run the benchmark in CI.** Every number above is from one run on one machine.
+4. **Run the benchmark in CI.** Every number above is from one run on one machine.
    Nothing re-measures it, so the next edit can quietly make it stale the way the
    hardcoded `0.08` did — as the probe count already did once.
-6. **Extend the wire suite where the claims are still unchecked.** It covers
+5. **Extend the wire suite where the claims are still unchecked.** It covers
    every route the dashboard can reach, and nothing else: there is no route yet
    that takes a body, no keep-alive, and no concurrent client. Each of those is
    a claim someone will eventually make, and the suite should already be red when
    they start.
+6. **Cover the `buffer` object in the gate.** The telemetry shape test asserts
+   the eight top-level keys and the three `engine` keys, but the sixteen
+   `buffer` fields are only emitted when the capacity pool is open, and the gate
+   deliberately runs without one. They are checked against a running engine, which
+   is weaker than a gate check. A scratch pool on a test volume would close it.
 
 ## Running things
 

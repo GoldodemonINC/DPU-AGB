@@ -37,6 +37,7 @@ const testing = std.testing;
 const win = @import("win");
 const telemetry = @import("telemetry.zig");
 const server = @import("server.zig");
+const server_context = @import("server/context.zig");
 
 const c = win.c;
 
@@ -119,10 +120,10 @@ pub const Response = struct {
 /// The server under test, plus the one client socket factory.
 pub const Harness = struct {
     srv: server.Server,
-    engine: server.EngineState,
+    engine: server_context.EngineState,
     sampler: telemetry.Sampler,
     query: win.Query,
-    ctx: server.Context,
+    ctx: server_context.Context,
     port: u16,
     buf: []u8,
     /// Scratch for request building. Separate from `buf`, which holds the
@@ -147,7 +148,7 @@ pub const Harness = struct {
         h.query.add(TEST_COUNTER_PATH, TEST_COUNTER_KEY) catch {};
 
         h.engine = .{};
-        h.engine.booted_at_ms = server.EngineState.nowMs();
+        h.engine.booted_at_ms = server_context.EngineState.nowMs();
 
         // Port 0: the OS picks a free port, so these tests cannot collide with
         // a running engine on 8787 or with a second test binary.

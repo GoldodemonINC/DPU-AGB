@@ -9,6 +9,7 @@ const std = @import("std");
 const win = @import("win");
 const telemetry = @import("telemetry.zig");
 const server = @import("server.zig");
+const server_context = @import("server/context.zig");
 const pool_mod = @import("pool.zig");
 
 const c = win.c;
@@ -78,7 +79,7 @@ pub fn main() !void {
         // the compile-time default, so the first advertised capacity is one the
         // volume can back. `p` is a const capture; the tier write goes through
         // the holder because raising a ceiling is not a read.
-        const res = pool_holder.?.applyTier(server.PowerMode.x_high.tier());
+        const res = pool_holder.?.applyTier(server_context.PowerMode.x_high.tier());
         std.debug.print("  capacity pool: P:\\DPU\\pool.vram  ceiling {d} GB  sparse={}\n", .{
             p.ceiling() / (1024 * 1024 * 1024),
             p.sparse(),
@@ -95,10 +96,10 @@ pub fn main() !void {
     defer if (pool_holder) |*p| p.deinit();
 
     var srv = try server.Server.bind(server.DEFAULT_PORT);
-    var engine = server.EngineState{};
-    engine.booted_at_ms = server.EngineState.nowMs();
+    var engine = server_context.EngineState{};
+    engine.booted_at_ms = server_context.EngineState.nowMs();
 
-    var ctx = server.Context{
+    var ctx = server_context.Context{
         .sampler = &sampler,
         .query = &query,
         .engine = &engine,
@@ -120,7 +121,7 @@ pub fn main() !void {
     while (true) {
         srv.serveOnce(&ctx);
 
-        const now = server.EngineState.nowMs();
+        const now = server_context.EngineState.nowMs();
         if (now - last_ms >= SAMPLE_MS) {
             _ = c.PdhCollectQueryData(query.handle);
             sampler.refresh();
@@ -135,7 +136,7 @@ pub fn main() !void {
 /// clock the server uses for uptime, without threading a helper import around.
 const SAMPLEState = struct {
     fn nowMs() i64 {
-        return server.EngineState.nowMs();
+        return server_context.EngineState.nowMs();
     }
 };
 

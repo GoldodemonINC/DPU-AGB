@@ -26,7 +26,7 @@
 //!
 //! ## Two rules the tables below obey
 //!
-//! Coverage is derived from `server.ASSETS` rather than restated. A hand-copied
+//! Coverage is derived from `assets.ASSETS` rather than restated. A hand-copied
 //! list of asset paths is a second place that has to agree with the router,
 //! and it would quietly stop covering a newly added asset -- the same failure
 //! mode #4 removed from the status code. Where a list is genuinely test data
@@ -35,7 +35,7 @@
 const std = @import("std");
 const testing = std.testing;
 const wire = @import("wire_harness.zig");
-const server = @import("server.zig");
+const assets = @import("server/assets.zig");
 
 const Harness = wire.Harness;
 const Response = wire.Response;
@@ -315,10 +315,10 @@ test "every asset answers HEAD with its GET length and no bytes" {
     // the day it is added. The floor stops an empty table from making this
     // vacuously true, which is the failure mode a derived list has and a
     // written-out one does not.
-    try testing.expect(server.ASSETS.len >= 3);
+    try testing.expect(assets.ASSETS.len >= 3);
 
     const h = try wire.harness();
-    for (server.ASSETS) |asset| {
+    for (assets.ASSETS) |asset| {
         try expectHeadMatchesGet(h, asset.path);
     }
 }
@@ -338,7 +338,7 @@ test "only HEAD suppresses the body" {
     // empty -- and a HEAD assertion alone would not notice, because it only
     // ever looks at responses that are already empty.
     const h = try wire.harness();
-    for (server.ASSETS) |asset| {
+    for (assets.ASSETS) |asset| {
         for (NON_HEAD_METHODS) |method| {
             const r = try h.get(method, asset.path);
             // Every one of these owes a body: the asset itself, or the
@@ -359,6 +359,107 @@ test "only HEAD suppresses the body" {
     const lower = try h.raw("head / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", "lowercase head");
     try expectStatus(lower, "405 Method Not Allowed", "lowercase head");
     try expectNonEmptyBody(lower, "lowercase head");
+}
+
+/// The keys of a flat JSON object, in the order they appear.
+///
+/// Not a substring search, and that is the whole point. `"total":` also occurs
+/// *inside* the `pool` object, so searching the document for `"total":` passes
+/// even when the top-level `total` object has been deleted -- which is exactly
+/// the mistake this exists to catch, and which it initially failed to.
+///
+/// This walks the bytes, tracking brace depth and skipping string literals, and
+/// reports only the names that sit at the object's own level.
+fn topLevelKeys(doc: []const u8, out: [][]const u8) [][]const u8 {
+    var n: usize = 0;
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i < doc.len and n < out.len) {
+        switch (doc[i]) {
+            '{' => depth += 1,
+            '}' => {
+                if (depth > 0) depth -= 1;
+            },
+            '"' => {
+                const start = i + 1;
+                var j = start;
+                while (j < doc.len and doc[j] != '"') {
+                    if (doc[j] == '\\') j += 1; // an escaped quote is not the end
+                    j += 1;
+                }
+                const name = doc[start..j];
+                i = j + 1;
+                // A key is a string at this object's own depth, followed by ':'.
+                if (depth == 1 and i < doc.len and doc[i] == ':') {
+                    out[n] = name;
+                    n += 1;
+                }
+                continue;
+            },
+            else => {},
+        }
+        i += 1;
+    }
+    return out[0..n];
+}
+
+fn hasKey(keys: []const []const u8, name: []const u8) bool {
+    for (keys) |k| {
+        if (std.mem.eql(u8, k, name)) return true;
+    }
+    return false;
+}
+
+test "the telemetry document keeps every key the dashboard parses" {
+    // Every other assertion in this file counts bytes. A serializer field
+    // dropped in a refactor changes the length and nothing else, so a
+    // count-based check sails straight past it.
+    //
+    // The `buffer` object's sixteen fields are deliberately absent from this
+    // list: they are only emitted when the capacity pool is open, and the gate
+    // deliberately runs without one so it never touches `P:\DPU\pool.vram`.
+    // They are checked against a running engine instead -- a weaker guarantee,
+    // recorded as such rather than papered over with a conditional assertion
+    // that passes either way.
+    const h = try wire.harness();
+    const r = try h.get("GET", "/api/telemetry");
+
+    const TOP_LEVEL = [_][]const u8{
+        "t",    "uptimeMs", "engine", "counters",
+        "pool", "procs",    "buffer", "total",
+    };
+
+    var found: [16][]const u8 = undefined;
+    const keys = topLevelKeys(r.body, &found);
+    for (TOP_LEVEL) |key| {
+        testing.expect(hasKey(keys, key)) catch |e| {
+            std.debug.print("\n  telemetry has no top-level key {s}\n  top-level keys are:", .{key});
+            for (keys) |k| std.debug.print(" {s}", .{k});
+            std.debug.print("\n  {s}\n", .{r.body});
+            return e;
+        };
+    }
+
+    // The engine object is nested, so its keys are checked at its own level.
+    const at = std.mem.indexOf(u8, r.body, "\"engine\":{") orelse return error.NoEngine;
+    const end = std.mem.indexOfScalarPos(u8, r.body, at, '}') orelse return error.NoEngine;
+    var found_engine: [8][]const u8 = undefined;
+    const engine_keys = topLevelKeys(r.body[at + "\"engine\":".len .. end + 1], &found_engine);
+    for ([_][]const u8{ "power", "prefetch", "split" }) |key| {
+        testing.expect(hasKey(engine_keys, key)) catch |e| {
+            std.debug.print("\n  telemetry engine object has no key {s}\n  {s}\n", .{
+                key, r.body[at .. end + 1],
+            });
+            return e;
+        };
+    }
+
+    // Still the shape the dashboard parses, and still the right size for its
+    // declared length.
+    try testing.expectEqual(@as(u8, '{'), r.body[0]);
+    try testing.expectEqual(@as(u8, '}'), r.body[r.body.len - 1]);
+    try r.expectLengthMatchesBody();
+    try expectStatus(r, "200 OK", "GET /api/telemetry");
 }
 
 test "a HEAD connection carries no phantom body and is closed after it" {
