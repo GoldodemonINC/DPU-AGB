@@ -526,3 +526,28 @@ that is what it is for, and `src/backend/icd/probe.zig` hardcodes the path.
 
 `zig build bench` **destroys `P:\DPU\pool.vram`** — it sweeps an 8 GiB working set
 through it and unlinks the file afterwards. The engine recreates it on next start.
+
+### A fresh clone must be able to pass the gate
+
+The blobs in this repository are stored with **mixed line endings** —
+`dpu/src/pool.zig` carries 292 CR bytes and 181 bare LFs — and until
+`.gitattributes` was added there was nothing telling git not to touch them. On
+Windows the default is `core.autocrlf=true`, which re-smudges every LF into CRLF
+on checkout: `pool.zig` came out at 473 CR bytes and `build.zig` at 1281, and
+`zig fmt --check` then failed on all eleven Zig files. **111/111 tests still
+passed** — only the formatting step went red — and `git status` reported the tree
+as clean throughout, so nothing surfaced the corruption until the gate ran.
+
+The fix is `* -text` in `.gitattributes`: no EOL conversion in either direction,
+so the checkout is byte-exact whatever `core.autocrlf` says, and git still
+renders text diffs rather than calling the files binary. Verified the only way
+that counts — a clone with the default settings and the attribute present at
+first checkout lands on 292/863 CR bytes, a clean `git status`, and
+`13/13 steps, 111/111 tests`.
+
+One trap in testing it: cloning and *then* switching to a branch that adds
+`.gitattributes` proves nothing, because git does not rewrite files whose blob
+is unchanged between the two branches — the already-corrupted bytes survive the
+switch. The attribute has to be present at the initial checkout, or the test is
+measuring the old checkout. Re-checking out with `rm -rf` and `git checkout --`
+reproduces the good state, which is what makes the failing case look fixed.
