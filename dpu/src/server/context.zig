@@ -48,8 +48,15 @@ pub const PowerMode = enum {
         };
     }
 
-    /// Prefetch depth multiplier. Real once the scheduler exists; for now the
-    /// dashboard shows it as the selected aggressiveness.
+    /// Prefetch depth, in *pages*, for `residency.Scheduler.read_ahead`.
+    ///
+    /// It is a page count rather than a multiplier because the granule is what
+    /// the scheduler trades against residency, and a multiplier would leave the
+    /// unit implicit. The scheduler this feeds now exists -- it was described
+    /// here as pending for as long as it did -- and the knob is deliberately
+    /// read-ahead only: it does not choose the eviction policy, because which
+    /// policy is right is a property of the client's access pattern and not of
+    /// how aggressive the user asked the engine to be.
     pub fn prefetchDepth(self: PowerMode) u32 {
         return switch (self) {
             .max => 8,

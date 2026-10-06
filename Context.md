@@ -5,12 +5,13 @@ applications as a discrete GPU through a user-mode installable client driver.
 
 ## Status at this commit
 
-`zig build check` — **111/111 tests**, exit 0, `zig fmt --check` clean. The gate
+`zig build check` — **138/138 tests**, exit 0, `zig fmt --check` clean. The gate
 also builds `dpu.exe`, so a green run now means the shipping binary compiles.
 
-`zig build probe` — **50/50, exit 0**, closing with
-`PROBE_SUMMARY: total=50 passed=50 failed=0 result=PASS` and
-`RESULT: PASS -- the DPU heap carries real bytes on disk`.
+`zig build probe` — **55/55, exit 0**, closing with
+`PROBE_SUMMARY: total=55 passed=55 failed=0 result=PASS` and
+`RESULT: PASS -- the DPU heap carries real bytes on disk`, and with **no loader
+warnings at all** under `VK_LOADER_DEBUG=error,warn`.
 
 Every number here was measured on this machine for this tree. An earlier copy of
 this file claimed the probe was 45/45; that was stale, and a number nobody re-ran
@@ -524,14 +525,399 @@ does 7.54 tok/s on the 3B and 2.51 tok/s on the 9B.
 
 The code is kept because the measurement is reusable and `dputest` is a real
 test -- 21/21 with the pool on, 3/3 with it off -- not because it is the route
-to an 8B model. The route to one is a compute path the ICD does not have: of the
-fourteen entry points a Vulkan compute client needs,
-`vkCreateShaderModule` and `vkCreateComputePipelines` are present and refused,
-and the other twelve -- `vkCmdDispatch`, every descriptor-set entry point,
-`vkCreatePipelineLayout` -- are absent from `src/backend/icd/icd.zig`.
+to an 8B model. The route to one is a compute path the ICD does not have, and
+that used to be an inference from reading `src/backend/icd/icd.zig`. It is now
+measured, through the real loader, with the iGPU as a control on the same run:
+
+| asked of the loader | Intel UHD (control) | DPU |
+| --- | --- | --- |
+| device extensions advertised | 130 | **0** |
+| `VK_KHR_buffer_device_address` | YES | **NO** |
+| compute entry points that resolve | 10 of 16 | **2 of 16** |
+| `vkCreateShaderModule` (valid SPIR-V) | `VK_SUCCESS` | **`VK_ERROR_FEATURE_NOT_PRESENT` (-8)** |
+| `vkCreatePipelineLayout` (empty) | `VK_SUCCESS` | **NULL, never called** |
+| `vkCreateComputePipelines` (1) | `VK_SUCCESS` | NULL, never reached |
+
+The two entry points DPU resolves are exactly the two it refuses with a
+definite status; the other fourteen are NULL, so a client dereferences a crash
+rather than a diagnosable error. `vkCmdDispatch`, every descriptor-set entry
+point and `vkCreatePipelineLayout` are among them. Advertising **zero**
+extensions is separately fatal on its own: without buffer device address there
+is no way to hand a buffer address to a shader at all, so `ggml-vulkan` stops
+before it reaches a pipeline. The control matters -- the same probe, the same
+loader and the same battery produce three `VK_SUCCESS` on a real compute-capable
+ICD, so the refusals belong to the DPU rather than to the harness.
+
+Two related defects fall out of the same run. `vk_icd.json` declares
+`"api_version":"1.3"` but the ICD does not implement
+`vkEnumerateInstanceVersion`, so the loader logs `treating as a 1.0 ICD`; the
+device property still reports 1.3.0 because DPU fills it in directly. And the
+loader finds the iGPU's ICD in the DriverStore
+(`...\iigd_dch.inf_amd64_...\igvk64.json`) by enumerating display devices, not
+through `HKLM\SOFTWARE\Khronos\Vulkan\Drivers`, which is empty -- so the
+absence of registered drivers on this machine does not mean the absence of
+Vulkan hardware.
+
+### `vkCmdCopyBuffer` had its pointer and count the wrong way round (fixed)
+
+**The previous revision of this file told the opposite story, and it was
+wrong.** It claimed `vkQueueSubmit` took eight arguments with no fence and that
+the vendored header had been hand-edited into a non-conformant API. Reviewer
+Greptile flagged that as P1 on the PR built from that claim, and checking the
+Khronos registry settled it:
+
+```
+VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount,
+                       const VkSubmitInfo* pSubmits, VkFence fence);
+
+typedef struct VkSubmitInfo {
+    VkStructureType sType; const void* pNext;
+    uint32_t waitSemaphoreCount; const VkSemaphore* pWaitSemaphores;
+    const VkPipelineStageFlags* pWaitDstStageMask;
+    uint32_t commandBufferCount; const VkCommandBuffer* pCommandBuffers;
+    uint32_t signalSemaphoreCount; const VkSemaphore* pSignalSemaphores;
+} VkSubmitInfo;   // no fence member, anywhere
+```
+
+Four arguments, fence last, and `VkSubmitInfo` carries no fence field at all.
+`main` already declared exactly that. So the header was conformant, the "fix"
+was a regression that would have handed a real loader seven arguments where it
+passed four, and the whole eight-argument story has been reverted.
+
+**What the real defect was**, and it was smaller and sharper: `icd.zig` maps the
+entry name `vkCmdCopyBuffer` straight onto `exec.vkCmdCopyBufferImpl`, and that
+function had the last two parameters the wrong way round:
+
+```zig
+regions: ?[*]const c.VkBufferCopy,   // was here
+region_count: u32,                   // was here
+```
+
+The loader calls per the specification -- `(cb, src, dst, regionCount,
+pRegions)` -- so the driver read `regions` as the count `1` and `region_count` as
+the low 32 bits of a pointer. One region became "read from address 1, for
+however many bytes were in the low half of a pointer". The header was right
+throughout, which is why the fix belongs in the impl.
+
+The probe hid it the way these things always hide: it declared its **own**
+function pointer for `vkCmdCopyBuffer` in the same wrong order, so the probe and
+the ICD agreed by construction and 111 green tests proved nothing about the ABI.
+
+Three probe defects were real and are fixed:
+
+- `pfn_wait` was declared with four arguments and called without a fence count,
+  so the fence pointer arrived where `fenceCount` belongs. `vkWaitForFences` has
+  five.
+- The loader-routing guard is back, so this class of drift cannot return
+  unnoticed: it asserts the **loader** routes `vkQueueSubmit`, `vkCmdCopyBuffer`,
+  `vkCmdFillBuffer` and `vkWaitForFences`.
+- The fence check could not fail. `vkWaitForFences` in this driver always returns
+  success, so `check(wrc == 0, ...)` was unfalsifiable. It now resets the fence
+  before each submission (the spec requires an unsignalled fence on re-submit,
+  and without it the status read would be answering itself) and asserts
+  `vkGetFenceStatus` returns `VK_SUCCESS`, which does fail when nothing ran.
+
+Probe count 51 -> 55. All four new checks are assertions that can go red.
+
+The lesson is worth keeping: **"the header disagreed with my memory of the spec"
+is not evidence that the header is wrong.** The registry is the arbiter, and it
+was one fetch away.
+
+## What 9B at 64k actually costs, measured
+
+The second diagram asks for something specific: 128 MB of VRAM plus 8 GB of RAM
+**cannot** run a 9B model at 64k context today, and with the DPU added it should
+**run**, at 0.7-6 tok/s. That is a claim about capacity and a claim about speed,
+and they turn out to have different answers.
+
+### The working set is per token, and the cache is the big half
+
+A decoder touches every weight once per token and then starts again, and
+attention reads the whole key/value history. So the bytes that matter are per
+token, not once:
+
+| | 3B (Llama-3.2) | 9B (gemma-2) |
+| --- | --- | --- |
+| layers / KV heads / head_dim | 28 / 8 / 128 | 42 / 8 / 256 |
+| KV bytes per token, f16 | 114,688 | 344,064 |
+| KV at 64k, f16 | **7.5 GB** | **22.5 GB** |
+| weights, f16 | 6.4 GB | 18.5 GB |
+| weights, q4 | 1.6 GB | 4.6 GB |
+
+At 64k the cache is the dominant term at both sizes, and it is the thing that
+makes the top row of the diagram true. The weights are the small half.
+
+### What the device actually does
+
+`zig build bench`, 2026-10-05. The volume sits behind a RAID controller with a
+large cache, so the small rows are measuring that cache and not the disk. The
+sweep now drops any row the volume cannot hold beside the pool's own reserve,
+and says so, rather than failing the whole run:
+
+| working set | write MB/s | read MB/s | rnd 4 KiB us |
+| --- | --- | --- | --- |
+| 64 MiB | 247 | 4860 | 4.5 |
+| 1024 MiB | 268 | 4515 | 4.4 |
+| 2048 MiB | 209 | 347 | 39.3 |
+| **4096 MiB** | 182 | **427** | 57.6 |
+| 8192 MiB | *skipped* -- needs 8.0 GB, headroom was 6.0 GB | | |
+
+**Run-to-run variance is real and is not noise to average away.** An earlier run
+the same day read 412.7 MB/s at 4096 MiB and 470.8 at 8192, and 4104 MB/s at
+2048 MiB where this one reads 347 -- the controller's cache state moves the cold
+boundary between 2 and 4 GiB. The device is therefore **roughly 400-500 MB/s
+sequential**, and every plan below is computed against the lowest device-sized
+row of *its own* run rather than a remembered number.
+
+Against RAM at 4004 MB/s memcpy and 0.100 us random, the pool's uncached random
+access is **57.6 us, or 576x slower**. That ratio, not the bandwidth, is the
+design constraint.
+
+### The granule is worth 5.4x on its own
+
+A scheduler does not read a file, it *faults*. One read in flight, same 4 GiB
+set, only the transfer size varying:
+
+| granule | read MB/s | per-read us |
+| --- | --- | --- |
+| 4 KiB | **106.8** | 36.5 |
+| 16 KiB | 289.2 | 54.0 |
+| 64 KiB | 530.0 | 117.9 |
+| 256 KiB | 575.0 | 434.7 |
+| **1 MiB** | **580.5** | 1722.5 |
+
+Effective throughput rises **5.4x** from the granule alone at identical byte
+counts (6.7x in the earlier run). That is the entire reason `residency.zig` takes
+a granule as policy rather than reading whatever the caller asked for.
+
+### The plan, from those measured constants
+
+`residency.plan` is arithmetic over a working set, a RAM budget and a measured
+machine -- no model, no geometry, no victory condition. Fed the table above
+(36.5 us faults, streaming planned against the lower of the two device-sized read
+rates, 6 GiB resident of 7.79 GiB):
+
+| working set | at 4 KiB | at 1 MiB | tok/s | bound |
+| --- | --- | --- | --- | --- |
+| 3B q4/q4, 64k | RESIDENT | RESIDENT | -- | none |
+| 3B q4 / f16 KV, 64k | STREAMED | STREAMED | 0.167 | bandwidth |
+| 9B q4/q4, 64k | STREAMED | STREAMED | 0.117 | bandwidth |
+| **9B f16, 64k** | **DOES NOT FIT** | **DOES NOT FIT** | **0.000** | none |
+
+The row the diagram is about is the last one, and it fails on **capacity, not
+speed**: 41.0 GB of working set against an 8 GiB pool ceiling and 13 GB free on
+`P:\`. No eviction policy recovers that, which is why the verdict is not
+`streamed` with a small number but `does_not_fit` with none.
+
+### What that means for the 0.7-6 tok/s claim
+
+- **"Can't run" -> "can run" is real, and it is the capacity half.** At 4 bits
+the 9B working set is 10.3 GB and streams. That is the diagram's headline and it
+holds.
+- **0.7 tok/s is not reachable at 9B/64k on this machine, and 6 is not close.**
+The 9B q4 row lands at **0.117 tok/s**, on a run whose device read rate was the
+optimistic end of the observed range. Raising it means moving fewer bytes per
+token, and at 64k the cache is 55% of the working set before quantisation is
+even considered. Quantising the *cache* is the lever, not the weights, and it is
+a model-side decision that no amount of DPU policy can make.
+- **6 tok/s requires the working set resident, not paged.** At a 427 MB/s device
+the budget is ~330 MB of misses per token, against a 5.6 GB f16 cache for the 3B
+alone. Only the `RESIDENT` row reaches that regime, and it does so without the
+pool: the third row of the table is what "fits" looks like.
+
+### The mechanism that does ship
+
+`src/backend/residency.zig` -- the layer `pool.zig` and `blockdev.zig` have
+referred to as "the residency scheduler" since before it existed. It is policy
+and arithmetic only: it imports nothing from the backend, holds no handles, and
+is tested as arithmetic rather than against a device.
+
+Three findings are encoded as behaviour rather than as comments:
+
+1. **LRU earns literally nothing on a cyclic scan.** A decoder's access pattern
+is every page once, then again, over a set larger than the cache -- the case
+where LRU evicts precisely the page it needs next. Two tests pin this: the same
+trace gives **0 hits** under `Policy.lru` and **8 hits** under `Policy.pinned`
+at the same capacity. This is why handing the weights to the pool made decoding
+slower, and `Policy.pinned` is the fix.
+2. **Fault latency and bandwidth bind separately.** The planner computes both and
+takes the maximum, so a device with a fast round trip and a slow stream is not
+modelled as fast. At 4 KiB the plan is fault-bound and at 1 MiB it is
+bandwidth-bound -- from the same machine, on the same bytes.
+3. **An unmeasured rate degrades to the measured limit, not to infinity.** A
+machine with no streaming figure plans against `granule / fault_us`, which is a
+genuine lower bound on cost. Reporting `inf` would be defensible arithmetic and
+a module nobody could use.
+
+### The correction that the measurement forced
+
+The pool is the **wrong place to store the weights**, and this is a design
+conclusion rather than a tuning one. A GGUF on disk is already a random-access
+backing store; copying it into `pool.vram` doubles the storage for the same
+bytes, adds a copy, and changes nothing about the access pattern. Route 1 did
+exactly that and measured the result. What the DPU can contribute is the *fault
+path* -- granule, read-ahead, eviction policy and the honest numbers above --
+applied to the file the model already lives in.
+
+## Unlinking the pool did not give the space back, and it was not NTFS
+
+`P:\` had lost ~4.7 GB across a session of benchmarks, with nothing on the volume
+holding it: `du` found no large file, and the pool was gone. Three hypotheses,
+each tested rather than argued:
+
+| experiment | free before | free after write | free after delete |
+| --- | --- | --- | --- |
+| 2 GiB plain file | 8300 MB | 6151 MB | **8300 MB** — returned |
+| 2 GiB sparse file (`fsutil sparse setflag`) | 8300 MB | 6244 MB | **8300 MB** — returned |
+| 512 MB sparse, deleted **while a second handle was open** | 8300 MB | 7754 MB | **7754 MB** — *not* returned |
+
+The first two clear the volume. The third is the mechanism: deleting a file
+another process has open fails with `ERROR_SHARING_VIOLATION` (`os.remove`
+surfaces it as `PermissionError 13`), and **the block layer discarded
+`DeleteFileW`'s return value**. So `destroy()` reported a clean exit while the
+pool's bytes stayed on disk -- and the next run reopened *that* pool instead of
+a fresh one, which is how several GB quietly accumulated.
+
+Two changes, both needed:
+
+- `FILE_SHARE_DELETE` on every open of the pool. With it, NTFS marks the file
+  delete-pending and reclaims when the last handle closes, so a peer reading the
+  pool no longer blocks its removal. This matters because the engine and the
+  ICD are separate processes holding the same file.
+- `destroy` records the outcome, exposed as `poolRemoved()`. `destroy` cannot
+  return an error -- its callers live in files this module does not own -- so
+  `zig build bench` now prints a warning naming the file when the pool could not
+  be removed, instead of quietly leaving it there.
+
+## Route 1 re-measured at 64k, and it corrected the planner
+
+Same experiment as before, but at `-c 65536` on the 3B, which is the context the
+"can't run" claim is about. `llama-completion`, 31 generated tokens, pool off and
+`GGML_DPU_POOL=1`:
+
+| 3B Q4_K_M at `-c 65536` | load | eval | exit |
+| --- | --- | --- | --- |
+| pool off | 2.06 s | **7.77 tok/s** | 0 |
+| pool on (`GGML_DPU_POOL=1`) | 8.45 s | **6.29 tok/s** | 0 |
+
+The pool hook engaged (`serving allocations >= 4 MiB from disk`), the load went
+4.1x slower because the weights now come off `P:\` once, and generation cost
+**19%**. That is a far milder penalty than route 1's 9B figure of 0.14 tok/s,
+which was never re-measured and is now suspect.
+
+**It also corrected the planner, which is the more useful result.** The 3B was
+predicted to stream at 0.167 tok/s from a working set priced at the full 64k
+context. It ran at 7.77 tok/s with no paging at all, because **the KV cache is
+only read up to the position actually reached**: 31 tokens of history is 3.6 MB,
+not the 7.5 GB a full window would hold. A 64k window is a *reservation*; the
+history is a *length*, and pricing a short run at its capacity predicts a
+slowdown that does not exist.
+
+`Footprint.working_set` is bytes touched at one position, and the module now
+says so with this measurement attached. The hard numbers earlier in this file --
+the 9B rows, which assume a filled context -- remain valid for a filled context
+and are explicitly scoped that way in the benchmark table.
+
+Not re-measured: the 9B at 64k, which would take hours at these rates. The 9B
+figures in the table above are a planner prediction over measured device
+constants, not an end-to-end run, and are labelled as such.
+
+### The gate did not compile the benchmark, and a shadowed local got through
+
+`zig build check` covered `src/backend` and `src/*.zig`; `bench.zig` sits in the
+same tree behind a step nobody runs by default. So a local constant named
+`rate` shadowed the file's top-level `fn rate`, `zig build check` stayed
+**138/138 and exit 0**, and `zig build bench` did not compile at all. That is the
+same failure this file already records for the executable, in a different file: a
+gate that cannot fail on an artifact in the repository is not covering it.
+
+Fixed by compiling `dpubench` in `check` without running it — running it writes
+gigabytes to `P:\`, which a gate must not do. Gate is now **17/17 steps**.
+
+The red proof matters more than the count. Reintroducing the shadow makes
+`zig build check` report
+
+```
++- compile exe dpubench Debug native 1 errors
+src\bench.zig:488:15: error: local constant shadows declaration of 'rate'
+Build Summary: 14/17 steps succeeded (1 failed); 138/138 tests passed
+exit 1
+```
+
+Note the **138/138 tests passed** on the failing line. That is the trap this
+project has already been caught by once: the exit code is the signal, and a
+filter or a summary line is not a passing test.
+
+### The release fix, verified end to end
+
+With `FILE_SHARE_DELETE` and the recorded outcome, one full `zig build bench`
+now returns the volume to where it started:
+
+| | free on `P:\` | `P:\DPU\pool.vram` |
+| --- | --- | --- |
+| before the run | 8300 MB | absent |
+| mid-sweep (4 GiB written) | 3933 MB | 4294967296 bytes |
+| after the run | **8301 MB** | **absent** |
+
+and the benchmark prints `pool removed; the volume has its space back`. That is
+the exact operation that used to lose gigabytes silently, and the warning path
+is there for the case where a peer still holds the pool open.
+
+**One consequence worth knowing:** the planner is now handed *usable* capacity
+(`min(ceiling, free - reserve)`) rather than the configured ceiling, so the 9B
+rows above no longer read `STREAMED` unconditionally. In the run above, with
+6 GB of headroom, **9B q4/q4 reported `DOES NOT FIT`** where it previously
+reported 0.117 tok/s against the 8 GiB ceiling. That is the fix working: the
+verdict now follows the storage the block device will actually agree to grow
+into, so the same scenario flips with the volume's free space. The `tok/s`
+figures in the table were taken on a run with the room to grant it.
 
 ## What comes next
 
+**The guard is now in place, and the probe count went from 50 to 51.** The probe
+resolves entry points through `devProc`, which falls back to the DPU's own table
+whenever the loader declines -- so the probe and the ICD agreed by construction,
+which is how the defect stayed green. A new check asserts that the **loader
+itself** routes `vkQueueSubmit`, `vkCmdCopyBuffer`, `vkCmdFillBuffer` and
+`vkWaitForFences`. It passes with 0 unrouted, which means the byte-identical
+round trips above really are loader-mediated rather than direct calls into the
+ICD, and an entry point that could only be satisfied by a fallback is now a
+visible failure instead of a silent downgrade.
+
+The check has teeth, which matters more than that it passes: adding an entry
+point neither the loader nor the ICD serves reports `1 unrouted`, names it, and
+takes the probe to `50/51` with **exit 1**.
+
+**The probe no longer requires another vendor's driver.** It used to assert the
+loader reported two physical devices, which quietly made the gate depend on an
+Intel iGPU ICD being installed: with `VK_DRIVER_FILES=./vk_icd.json` -- the DPU
+as the only driver -- it reported one device and exited 1, and it would have
+done the same on every AMD or NVIDIA box and on any CI runner. Enumeration is
+now asserted to return at least one device, and whether the DPU is present is
+decided where it always should have been, by vendor and device ID. All four
+cases behave:
+
+| environment | result |
+| --- | --- |
+| DPU only, `VK_DRIVER_FILES=./vk_icd.json` | 51/51, exit 0 |
+| ambient iGPU + DPU, `zig build probe` | 51/51, exit 0 |
+| DPU absent (no `VK_*` set) | exit 1, `the DPU is present` |
+| no ICDs at all | exit 3, `vkCreateInstance -> VK_ERROR_INCOMPATIBLE_DRIVER` |
+
+The third row is the one that keeps this honest. Before the change the same
+run failed on the device *count*, which named the wrong problem; it now fails
+on the check that states the real one -- the DPU was not found -- so relaxing
+the count could not quietly turn the probe into a no-op.
+
+One item from that list is still open: add `vkEnumerateInstanceVersion` so
+`vk_icd.json` can honestly declare 1.3. Without it the loader logs `treating as
+a 1.0 ICD`, because the manifest's declared API version is never confirmed.
+
+0. **Wire the residency scheduler to a real fault path.** It exists, it is
+   tested, and nothing calls it yet -- `prefetchDepth` is now a page count for
+   `residency.Scheduler.read_ahead` rather than a display value, but no client
+   faults through it. Until one does, the plan table is a prediction and not a
+   measurement, and the difference matters.
 1. **Retire #5, #6 and #7.** They are fully contained in #8. Closing them is the
    user's call, not the agent's.
 2. **Multi-segment pool** — the tier resolver sums free space across roots and
@@ -552,6 +938,14 @@ and the other twelve -- `vkCmdDispatch`, every descriptor-set entry point,
    never written to, so every counter it reports is a zero. The same test with a
    pool that has actually absorbed and read back blocks would cover the sampler
    arithmetic, which nothing in the gate touches today.
+7. **Measure the iGPU baseline -- the one number that decides Route 1.** The
+   iGPU does have a working Vulkan driver (`igvk64.dll`, apiVersion 1.3.280,
+   130 extensions, and it returns `VK_SUCCESS` from `vkCreateComputePipelines`),
+   so the 10-40 TPS target can be measured on hardware rather than argued about
+   from a CPU-only 2.51 tok/s. Building `ggml-vulkan` needs `glslc` and the
+   Vulkan headers, and the SDK install has failed twice (eight unattended
+   attempts, then a manual run that logged `Installation aborted!` and rolled
+   `C:\VulkanSDK` back out). Nothing else is missing.
 
 ## Running things
 

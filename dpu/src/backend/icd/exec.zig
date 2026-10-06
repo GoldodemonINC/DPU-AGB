@@ -628,12 +628,26 @@ fn recordOrLatch(cb: *CommandBuffer, cmd: Command) void {
     if (rc != c.VK_SUCCESS and cb.err == c.VK_SUCCESS) cb.err = rc;
 }
 
+/// `vkCmdCopyBuffer` per the Vulkan ABI: **the count precedes the array**.
+///
+/// These parameters were the other way round. The entry table maps the name
+/// `vkCmdCopyBuffer` straight onto this function, so the loader -- which calls
+/// it with the argument order the specification gives -- handed this function
+/// `regionCount = 1` and `pRegions = &region`, and this function read
+/// `regions` as the pointer and `region_count` as the count. One region became
+/// "read from address 1, for however many bytes happened to be in the low 32
+/// bits of a pointer".
+///
+/// The probe hid it for as long as it was there because the probe declared its
+/// own function pointer in the same wrong order, so the probe and the ICD agreed
+/// by construction. The header was always right, which is why the fix belongs
+/// here and not in the declaration.
 pub fn vkCmdCopyBufferImpl(
     handle: ?*anyopaque,
     src: ?*anyopaque,
     dst: ?*anyopaque,
-    regions: ?[*]const c.VkBufferCopy,
     region_count: u32,
+    regions: ?[*]const c.VkBufferCopy,
 ) callconv(.c) void {
     const cb = asCommandBuffer(handle) orelse return;
     const s: *Buffer = @ptrCast(@alignCast(src orelse return));
