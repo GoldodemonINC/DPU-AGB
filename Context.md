@@ -5,9 +5,17 @@ applications as a discrete GPU through a user-mode installable client driver.
 
 ## Status at this commit
 
-`zig build check` — **151/151 tests** (17/17 steps), exit 0, `zig fmt --check`
-clean. The gate also builds `dpu.exe` and `dpubench`, so a green run means both
-shipped binaries compile. The eleven new tests are the granule fault path's.
+`zig build check` — **152/152 tests** (19/19 steps), exit 0, `zig fmt --check`
+clean, run on a throwaway cache. The gate also builds `dpu.exe` and `dpubench`,
+so a green run means both shipped binaries compile. The eleven tests the granule
+fault path added are unchanged; the one this branch adds is the OpenGL backend's
+contract pin, which is a compile-time assertion and so needs no display.
+
+`zig build gl-test` — **8/8 tests**, exit 0, and it is deliberately *not* in
+`check`. It creates a real WGL context, so it needs a live WindowStation and
+hangs rather than fails without one -- the same reason the Vulkan probe is not in
+the gate. On this machine it passes; the GL backend's section below has the
+detail, including the one new test that proves a real `glReadPixels` ran.
 
 `zig build probe` — **61/61, exit 0**, closing with
 `PROBE_SUMMARY: total=61 passed=61 failed=0 result=PASS` and
@@ -51,10 +59,17 @@ is worse than no number.
 | `14700fe` | #12 | Make a fresh Windows clone able to pass the gate |
 | `71a3455` | #13 | Measure route 1: serving llama.cpp's weights from the DPU pool |
 | `5232655` | #16 | Revert the wrong ABI fix, land residency on top, and stop the pool leaking disk |
+| `454d34b` | #17 | Add the missing root README, and correct the stale claims in dpu's |
+| `bc33558` | #18 | Spend the granule: a fault path that reads it, not just prices it |
 
 #14 and #15 were closed without merging; #16 replaced both, based directly on
-`main` with no stacked dependency. **#17 is the only open PR**, carrying the root
-README and the corrections to `dpu/README.md`.
+`main` with no stacked dependency. #17 merged at `454d34b`. **#18 is the only
+open PR -- the granule fault path -- and the OpenGL read backend is stacked on
+it**, because the contract pin below instantiates `residency.Faults`, which #18
+is what introduces. The stacked branch is `feat/opengl-read-backend`; it
+targets `feat/granule-fault-path` so its diff is the GL work alone, and it
+retargets to `main` the moment #18 merges. Nothing about the backend's *code*
+depends on #18 -- that was measured, see below -- only the pin does.
 
 **Every one of #5 to #10 is now merged**, along with #11, #12 and #13. The linear
 stack they were blocked on resolved in the order it was predicted to: #8, then
@@ -864,6 +879,101 @@ MiB sweep row before reaching it, on this branch and on `origin/main` alike.
 It compiles and is wired into `measureGranules`, and it is the first thing to
 run once the volume has room for the sweep.
 
+## The fault path's backend is now a real device, not just the pool
+
+`residency.Faults(Backend)` was written against `blockdev.BlockDevice` and had
+only ever run against it and against a `FakeBackend` in its own tests. `Backend`
+is a comptime parameter, so any type exposing
+`read(self: *Backend, offset: u64, buf: []u8) !usize` qualifies -- but that is a
+contract nobody had ever instantiated against a *second real device*.
+
+`dpu/src/backend/gl.zig` is that second device. It creates a hidden WGL context
+on the host's GPU and reads the framebuffer with `glReadPixels`, so a granule is
+one call into video memory instead of 4 KiB at a time through the disk pool:
+
+```zig
+const F = residency.Faults(gl.Backend);
+var backend = try gl.Backend.init(allocator);
+var faults = try F.init(allocator, &backend, .{ .granule = 64 * 1024, ... });
+```
+
+**What it is.** A read backend and nothing else. No swapchain, no shader, no
+present, no video-memory allocation; the context is hidden and never shown, and
+the bytes it returns are whatever the framebuffer already holds -- cleared to
+black on init. `read` treats the byte offset as a row-major RGBA pixel offset
+(4 bytes per pixel) and returns the byte count actually read, which is short at
+the edge of the surface. That short tail is the same shape the fault path
+already handles for the pool's last granule, which is why it is a drop-in.
+
+**What it is not.** A replacement for the Vulkan ICD. The ICD owns a device-local
+heap backed by the disk pool; this reads the framebuffer of the host's existing
+GL context. Different devices for different purposes, and the fault path can be
+backed by either.
+
+### The claim is a compile error if it stops being true
+
+`gl.zig`'s header claims it is a drop-in for `residency.Faults(GLBackend)`. An
+interface claim whose only assertion is prose rots the moment either side moves.
+`dpu/src/backend/gl_contract_test.zig` instantiates the *real* fault path over
+the *real* backend and takes the address of its entry points, which forces Zig to
+analyse their bodies against `gl.Backend`. It is a type-level fact, so it needs
+no display, so it lives in `zig build check` rather than behind `gl-test`.
+
+It was checked that the pin can go red, because a pin that cannot fail proves
+nothing. Changing `read`'s offset from `u64` to `u32` -- a change `gl.zig`'s own
+tests do *not* notice, because they pass `u32`-sized literals -- produces
+`error: expected type 'u32', found 'u64'` at `residency.zig:692`, reported
+against the contract module, with `check` at exit 1. Restoring the signature
+returns it to green.
+
+### Independence, stated because it was measured rather than assumed
+
+The backend's implementation does not depend on the granule branch that
+introduces `residency.Faults`. Its only imports are `std` and `win`. In a
+worktree detached at `origin/main`, with `gl.zig` and the `build.zig` wiring
+copied in, `zig build gl-test` is **8/8, exit 0** -- the drop-in works against
+`main` even though the fault path it targets does not exist there yet. What does
+depend on the granule branch is the contract pin, for the trivial reason that
+`residency.Faults` is the thing being pinned: that same worktree's
+`zig build check` fails with exactly one error, `residency has no member named
+'Faults'`. Hence the stacked base recorded above.
+
+### The live tests read real pixels, and one of them proves it
+
+`gl-test` creates a real context, so its tests cannot run at all without a GPU --
+but "cannot run without GL" is not the same as "proves GL returned the data".
+The all-zero test cannot tell a real `glReadPixels` from a buffer that merely
+stayed `undefined`, because a cleared-to-black framebuffer and untouched memory
+are both zero. A new test clears the framebuffer to `(0.25, 0.5, 0.75, 1.0)` and
+asserts the channels come back as `64, 128, 191, 255` within +/-2, which
+undefined memory cannot produce. Partial-edge reads (byte 262140 returning 4, not
+8) and 4 KiB-aligned reads are covered as well.
+
+### The MinGW translate-c workarounds, itemised
+
+Zig 0.16's translate-c of the MinGW headers does not yield a usable `GL/wgl.h`,
+so four workarounds are in the file. They are the part a reviewer cannot infer
+from the code, so each is deliberate and named here:
+
+- **`_FORTIFY_SOURCE=0` via `addCMacro`**, the same mitigation `win_mod` already
+  carries, because the GL header pulls in the same broken inline fortify
+  wrappers that made release builds fail.
+- **A local `const GLsizei = i32`**, because the translated `GL/gl.h` does not
+  expose `GLsizei` at all.
+- **`ogl.glPixelStorei`, not `c.glPixelStorei`**, because the GL entry points
+  land in the `@cImport` namespace, not in `win`'s.
+- **Raw resource IDs instead of their names.** `IDI_APPLICATION`, `IDC_ARROW`
+  and `COLOR_WINDOW` are MinGW macros of the form `func##A`, which translate-c
+  cannot resolve (`undefined identifier 'A'`). `LoadIconA`/`LoadCursorA` are
+  handed `@ptrFromInt(@as(usize, 32512))` and the window class's background brush
+  is left `null`. These are the values in `winuser.h`, written as integers so the
+  broken macro path is never generated.
+
+The translated `PIXELFORMATDESCRIPTOR` also drops the four `cAccum*Shift` fields
+the canonical Win32 struct has, so the struct literal is trimmed to the fields
+the header actually defines. None of these change behaviour; they are the cost of
+`@cImport`ing a GL header on this toolchain.
+
 ## Unlinking the pool did not give the space back, and it was not NTFS
 
 `P:\` had lost ~4.7 GB across a session of benchmarks, with nothing on the volume
@@ -1025,15 +1135,21 @@ That list is now closed: `vkEnumerateInstanceVersion` is implemented, the loader
 confirms the manifest's 1.3, and the interface version moved to 5 to match. See
 the section on the loader/ICD handle contract above.
 
-0. ~~**Wire the residency scheduler to a real fault path.**~~ **Done, with one
-   honest gap.** `residency.Faults(Backend)` is a real read path: a miss fetches
-   a whole granule, the rest is served from RAM, and `Pool.faults()` exposes it
-   over the real block device. The gap is that **no production client routes
-   through it yet** -- the benchmark's `measureFaultPath` does, and the eleven
-   new tests do, but the ICD reads through `blockdev` directly and nothing in
-   the engine calls `Pool.faults`. So the plan table is still a *prediction*;
-   what is no longer a prediction is the granule, which is now a counted
-   round-trip saving rather than a device row.
+0. ~~**Wire the residency scheduler to a real fault path, over a real device.**~~
+   **Done, with one honest gap.** `residency.Faults(Backend)` is a real read
+   path: a miss fetches a whole granule, the rest is served from RAM, and
+   `Pool.faults()` exposes it over the real block device. It now has a *second*
+   real backend too -- `gl.zig`, a WGL read backend over the host's framebuffer --
+   and `gl_contract_test.zig` turns its "drop-in" claim into a compile error if
+   it stops holding. **The gap is that neither one has a production client.**
+   The benchmark's `measureFaultPath` and the tests exercise them, but the ICD
+   reads through `blockdev` directly and nothing in the engine calls
+   `Pool.faults`. So the plan table is still a *prediction*; what is no longer a
+   prediction is the granule, which is now a counted round-trip saving rather
+   than a device row. **The next task is the one this gap names: route a real
+   read through the fault path** -- the engine's weight loader or the ICD's copy
+   path -- and measure it, because until then the fault path and the GL backend
+   are both verified mechanisms with no caller.
 1. **Fix the sweep's stale headroom budget.** The benchmark takes its headroom
    once, before the first row, and every row then commits its bytes to the same
    volume -- so the last row is sized against a budget that is out of date by
@@ -1085,9 +1201,15 @@ No Vulkan SDK is required; Windows ships a loader. Always use a throwaway cache 
 cd dpu
 TMPD=$(mktemp -d)
 /a/toolchain/zig/zig.exe build check --cache-dir "$TMPD/l" --global-cache-dir "$TMPD/g" --summary all
+/a/toolchain/zig/zig.exe build gl-test --cache-dir "$TMPD/l" --global-cache-dir "$TMPD/g" --summary all
 /a/toolchain/zig/zig.exe build probe --cache-dir "$TMPD/l" --global-cache-dir "$TMPD/g" --summary all
 /a/toolchain/zig/zig.exe build bench --cache-dir "$TMPD/l" --global-cache-dir "$TMPD/g" --summary all
 ```
+
+`gl-test` is the one step that needs a **display**: it creates a real WGL
+context, which hangs rather than fails from a non-interactive session, so it is
+not in `check`. Run it on a machine with a WindowStation. Everything else in
+this list is headless.
 
 `zig build check` writes `zig-out/bin/dpu.exe`; that is deliberate, and it means
 the gate is no longer a pure verification step. To run the binary directly,

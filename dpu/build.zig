@@ -142,6 +142,29 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    // ---------------------------------------------------------------- OpenGL backend
+    //
+    // A WGL-based read backend for the residency fault path, used when a real
+    // GPU is present and the fault path wants to read a granule from the
+    // framebuffer rather than from the disk pool. It is a drop-in for any
+    // call site that talks to `blockdev.BlockDevice`, because both expose
+    // `read(self: *Backend, offset: u64, buf: []u8)`.
+    //
+    // This is *not* a replacement for the Vulkan ICD. The ICD owns a
+    // device-local heap backed by the disk pool; this backend reads from the
+    // framebuffer of the host's existing GL context. They are different devices
+    // for different purposes, and the fault path can be backed by either.
+    const gl_mod = b.createModule(.{
+        .root_source_file = b.path("src/backend/gl.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    gl_mod.addCMacro("_FORTIFY_SOURCE", "0");
+    gl_mod.addImport("win", win_mod);
+    gl_mod.linkSystemLibrary("opengl32", .{});
+    gl_mod.linkSystemLibrary("gdi32", .{});
+
     // There used to be two more copies of these four modules here -- ReleaseFast
     // twins for the benchmark and ReleaseSmall twins for the driver -- because
     // a module's optimise mode is fixed where it is declared, and the shared
@@ -261,6 +284,9 @@ pub fn build(b: *std.Build) void {
     const run_icd_tests = b.addRunArtifact(icd_tests);
     test_step.dependOn(&run_icd_tests.step);
 
+    // Same reason again: gl.zig is a named module, so Zig would not discover
+    // its tests from the backend root. Seven assertions would go quiet without
+    // anything going red.
     // The Vulkan ABI assertions live in their own module because they are a
     // self-contained claim about the headers, and keeping them separate means a
     // header upgrade fails on its own rather than inside the backend suite.
@@ -274,6 +300,39 @@ pub fn build(b: *std.Build) void {
     const abi_tests = b.addTest(.{ .root_module = abi_mod });
     const abi_step = b.step("test-vkabi", "Assert the vendored Vulkan headers match the 1.3 ABI");
     abi_step.dependOn(&b.addRunArtifact(abi_tests).step);
+
+    // ---------------------------------------------------------------- OpenGL tests
+    //
+    // These require a live WindowStation / display, like the Vulkan probe.
+    // They are NOT part of the check gate for the same reason the probe is not:
+    // creating a WGL context from a non-interactive session hangs rather than
+    // failing. Run them on demand with `zig build gl-test` when a display is
+    // available.
+    const gl_tests = b.addTest(.{ .root_module = gl_mod });
+    const run_gl_tests = b.addRunArtifact(gl_tests);
+    const gl_step = b.step("gl-test", "Run the OpenGL backend tests (needs a display)");
+    gl_step.dependOn(&run_gl_tests.step);
+
+    // ------------------------------------------------------- OpenGL contract pin
+    //
+    // `gl.zig` claims in its header to be a drop-in backend for
+    // `residency.Faults(GLBackend)`. This module makes that claim executable:
+    // it instantiates the real fault path over the real backend and forces the
+    // entry points to be analysed, so a signature drift is a compile error.
+    //
+    // Unlike `gl-test`, it needs no display -- it is a type-level fact -- so it
+    // is part of the `check` gate. That is the point: the backend's central
+    // claim should not be verifiable only on a machine with a WindowStation.
+    const gl_contract_mod = b.createModule(.{
+        .root_source_file = b.path("src/backend/gl_contract_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    gl_contract_mod.addImport("residency", residency_mod);
+    gl_contract_mod.addImport("gl", gl_mod);
+    const gl_contract_tests = b.addTest(.{ .root_module = gl_contract_mod });
+    const run_gl_contract_tests = b.addRunArtifact(gl_contract_tests);
 
     // ---------------------------------------------------------------- benchmark
     const bench_mod = b.createModule(.{
@@ -452,6 +511,9 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&run_tiers_tests.step);
     check_step.dependOn(&run_residency_tests.step);
     check_step.dependOn(&run_icd_tests.step);
+    // The pin that the OpenGL backend satisfies `residency.Faults`' contract.
+    // Compile-time only, so no display is needed and it belongs in the gate.
+    check_step.dependOn(&run_gl_contract_tests.step);
     check_step.dependOn(bench_compile_check);
     check_step.dependOn(&b.addRunArtifact(abi_tests).step);
 }
