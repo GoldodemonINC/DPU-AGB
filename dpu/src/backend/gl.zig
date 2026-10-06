@@ -29,7 +29,7 @@
 //!   swapchain, no shader, no pipeline. The context is hidden and never shown.
 //! - It is not thread-safe. WGL contexts are thread-affine and the backend holds
 //!   a single context for its lifetime. Two backends in two threads each get
-//!   their own context (see `class_refs` for why that works at all); one backend
+//!   their own context (see `class_mutex` for why that works at all); one backend
 //!   used from two threads is undefined.
 
 const std = @import("std");
@@ -57,16 +57,57 @@ const CLASS_NAME = "DPUGLBackend";
 
 /// How many live backends share the process-wide window class.
 ///
-/// A window class is process-global, not per-context: the second backend in a
-/// process finds the name already registered and `RegisterClassExA` fails with
-/// `ERROR_CLASS_ALREADY_EXISTS`. That is not an error -- it means a sibling (or
-/// a previous instance that has not finished tearing down) owns the name -- so
-/// it is treated as success. The count tracks live backends and the class is
-/// unregistered only when the last one goes, because a backend that unregisters
-/// the class out from under a live sibling is a bug, not cleanup.
-var class_refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+/// A window class is process-global, not per-context. Registration and the
+/// count that guards it are therefore one critical section: an atomic counter
+/// is not enough, because `register` is *test-count-register-increment* and
+/// `release` is *decrement-test-unregister*, and the two pairs must not
+/// interleave. If they can, a registration observes the class as already
+/// present (and treats that as success) in the window before another thread's
+/// decrement removes it, leaving that thread holding a count above zero and no
+/// class to create a window from. The lock makes each pair one step, so the
+/// count is zero exactly when the name is unregistered.
+///
+/// When the count is already positive the name is registered, so `register`
+/// only takes a reference: the OS call happens on the 0 -> 1 transition and
+/// `UnregisterClassA` on the 1 -> 0 transition. A sibling -- or a previous
+/// instance still tearing down -- owning the name is expected, not an error.
+///
+/// `std.Thread.Mutex` is gone in this toolchain and `std.Io.Mutex` wants an
+/// `Io` the backend does not have, so this is the std spinlock. The critical
+/// section is a pair of short Win32 calls taken at most twice in a backend's
+/// life, so spinning costs nothing in practice.
+var class_mutex: std.atomic.Mutex = .unlocked;
+var class_refs: u32 = 0;
+
+fn lockClass() void {
+    while (!class_mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn unlockClass() void {
+    class_mutex.unlock();
+}
+
+/// The live-backend count under the same lock, for the lifecycle tests that
+/// assert the count returns to where it started.
+fn classRefCount() u32 {
+    lockClass();
+    defer unlockClass();
+    return class_refs;
+}
 
 fn registerWindowClass() !void {
+    lockClass();
+    defer unlockClass();
+
+    // A sibling already registered the name. Taking a reference here rather
+    // than calling `RegisterClassExA` again is what closes the race: no thread
+    // can see "already exists" and then have the class removed from under it by
+    // the thread that is unregistering.
+    if (class_refs > 0) {
+        class_refs += 1;
+        return;
+    }
+
     const wc = c.WNDCLASSEXA{
         .cbSize = @sizeOf(c.WNDCLASSEXA),
         .style = c.CS_HREDRAW | c.CS_VREDRAW,
@@ -86,12 +127,14 @@ fn registerWindowClass() !void {
     if (c.RegisterClassExA(&wc) == 0) {
         if (c.GetLastError() != c.ERROR_CLASS_ALREADY_EXISTS) return error.GlContextFailed;
     }
-    _ = class_refs.fetchAdd(1, .monotonic);
+    class_refs += 1;
 }
 
 fn releaseWindowClass() void {
-    // `fetchSub` returns the previous value, so 1 means this was the last one.
-    if (class_refs.fetchSub(1, .monotonic) == 1) {
+    lockClass();
+    defer unlockClass();
+    class_refs -= 1;
+    if (class_refs == 0) {
         _ = c.UnregisterClassA(CLASS_NAME, c.GetModuleHandleA(null));
     }
 }
@@ -241,11 +284,18 @@ pub const Backend = struct {
     /// that is the contract `blockdev.BlockDevice` keeps, and a backend that
     /// broke it would hand the fault path plausible bytes that are wrong.
     ///
-    /// The buffer length must be a multiple of 4, because `glReadPixels` with
-    /// `GL_UNSIGNED_BYTE` and `GL_PACK_ALIGNMENT = 4` requires it. This is the
-    /// same alignment contract `blockdev` imposes for `NO_BUFFERING`, and the
-    /// residency slab is allocated to it, so a fault path backed by either
-    /// device can use the same slab.
+    /// Both the offset and the buffer length must be multiples of 4. `blockdev`
+    /// refuses the same two shapes with `NotAligned` and offers separate
+    /// `readUnaligned`/`writeUnaligned` helpers that bounce through an aligned
+    /// staging buffer; this backend is a drop-in for its `read` and so refuses
+    /// rather than rounding. Rounding the offset down to the containing pixel
+    /// would return bytes shifted by one to three and report success, which is
+    /// the silent-truncation failure `blockdev`'s header names explicitly.
+    ///
+    /// The length rule is also what `glReadPixels` needs: with
+    /// `GL_UNSIGNED_BYTE` and `GL_PACK_ALIGNMENT = 4` every row it writes is a
+    /// multiple of 4 bytes. The residency slab is allocated to the same
+    /// boundary, so a fault path backed by either device can use the same slab.
     ///
     /// Returns the byte count actually read. A short count means the surface
     /// ended inside the request; an offset at or past the end returns 0. A read
@@ -258,6 +308,13 @@ pub const Backend = struct {
         if (buf.len == 0) return 0;
         if (buf.len % 4 != 0) {
             self.last_error = "buffer not 4-byte aligned";
+            return error.GlNotAligned;
+        }
+        // A pixel read has to start at a pixel. Truncating an unaligned offset
+        // returns bytes shifted by up to 3 while reporting success, so it is
+        // refused -- the same answer `blockdev.read` gives for the same input.
+        if (offset % 4 != 0) {
+            self.last_error = "offset not 4-byte aligned";
             return error.GlNotAligned;
         }
 
@@ -538,6 +595,9 @@ test "an offset at or past the end of the surface returns zero" {
     // Well past the end, where the old row arithmetic underflowed `height - py`
     // and trapped in a safety-checked build.
     try testing.expectEqual(@as(usize, 0), try backend.read(surface_bytes + 65536, &buf));
+    // The largest aligned offset there is: the pixel index must not overflow,
+    // and it lands far past the surface.
+    try testing.expectEqual(@as(usize, 0), try backend.read(std.math.maxInt(u64) - 3, &buf));
 }
 
 test "reading past the framebuffer edge returns a short count" {
@@ -599,4 +659,268 @@ test "an OpenGL backend survives destruction and recreation" {
     backend = try Backend.init(testing.allocator);
     defer backend.deinit();
     try testing.expect(backend.valid());
+}
+
+test "an unaligned offset is refused rather than silently rounded down" {
+    var backend = try Backend.init(testing.allocator);
+    defer backend.deinit();
+
+    var buf: [8]u8 = undefined;
+    // Rounding these down to the containing pixel returned bytes shifted by one
+    // to three and reported success. `blockdev.read` refuses the same input, and
+    // this backend is a drop-in for it.
+    for ([_]u64{ 1, 2, 3, 4097, 4098, 4099, 262141 }) |off| {
+        try testing.expectError(Error.GlNotAligned, backend.read(off, &buf));
+    }
+    // The aligned neighbours are still served.
+    try testing.expectEqual(@as(usize, 8), try backend.read(4, &buf));
+    try testing.expectEqual(@as(usize, 8), try backend.read(4096, &buf));
+    try testing.expectEqual(@as(usize, 4), try backend.read(262140, &buf));
+}
+
+test "an unaligned start near the end does not over-report" {
+    var backend = try Backend.init(testing.allocator);
+    defer backend.deinit();
+    const surface = @as(u64, backend.width) * @as(u64, backend.height) * 4;
+
+    var buf: [8]u8 = undefined;
+    // Five bytes remain from here. The old code rounded down to a pixel and
+    // returned a full, shifted 8 bytes -- more than the surface holds from the
+    // requested offset.
+    try testing.expectError(Error.GlNotAligned, backend.read(surface - 5, &buf));
+    // The aligned equivalent is a genuine short read.
+    try testing.expectEqual(@as(usize, 4), try backend.read(surface - 4, &buf));
+}
+
+test "a zero-length buffer returns zero without a read" {
+    var backend = try Backend.init(testing.allocator);
+    defer backend.deinit();
+
+    var buf: [4]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try backend.read(0, buf[0..0]));
+    // Nothing was asked for, so even an unaligned offset past the end is 0
+    // rather than an alignment error.
+    try testing.expectEqual(@as(usize, 0), try backend.read((1 << 40) | 3, buf[0..0]));
+}
+
+test "a length larger than the surface returns the surface remainder" {
+    var backend = try Backend.init(testing.allocator);
+    defer backend.deinit();
+    const surface: usize = @as(usize, backend.width) * backend.height * 4;
+
+    const over = try testing.allocator.alloc(u8, surface + 4096);
+    defer testing.allocator.free(over);
+    // From the start: the whole surface, no more.
+    try testing.expectEqual(surface, try backend.read(0, over));
+
+    const big = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(big);
+    // From a mid-surface aligned offset: exactly the remainder, then nothing.
+    try testing.expectEqual(@as(usize, 1024), try backend.read(surface - 1024, big));
+    try testing.expectEqual(@as(usize, 0), try backend.read(surface, big));
+}
+
+test "an unaligned base pointer still gets the right bytes" {
+    var backend = try Backend.init(testing.allocator);
+    defer backend.deinit();
+
+    ogl.glClearColor(0.0, 0.0, 1.0, 1.0);
+    ogl.glClear(ogl.GL_COLOR_BUFFER_BIT);
+
+    // GL_PACK_ALIGNMENT governs the stride between rows, not the base address,
+    // so a buffer that does not start on a 4-byte boundary must still be filled
+    // correctly. Only the window into `raw` is unaligned.
+    var aligned: [32]u8 = undefined;
+    try testing.expectEqual(@as(usize, 32), try backend.read(0, &aligned));
+
+    var raw: [40]u8 = undefined;
+    try testing.expectEqual(@as(usize, 32), try backend.read(0, raw[3..35]));
+    try testing.expectEqualSlices(u8, &aligned, raw[3..35]);
+}
+
+test "a read spanning two row boundaries keeps rows in order" {
+    var backend = try Backend.init(testing.allocator);
+    defer backend.deinit();
+    const w = backend.width;
+
+    // Row 0 red, row 1 green, row 2 blue, everything else black.
+    ogl.glClearColor(0.0, 0.0, 0.0, 1.0);
+    ogl.glClear(ogl.GL_COLOR_BUFFER_BIT);
+    ogl.glEnable(ogl.GL_SCISSOR_TEST);
+    const row_colors = [_][3]f32{ .{ 1.0, 0.0, 0.0 }, .{ 0.0, 1.0, 0.0 }, .{ 0.0, 0.0, 1.0 } };
+    for (row_colors, 0..) |col, y| {
+        ogl.glScissor(0, @intCast(y), @intCast(w), 1);
+        ogl.glClearColor(col[0], col[1], col[2], 1.0);
+        ogl.glClear(ogl.GL_COLOR_BUFFER_BIT);
+    }
+    ogl.glDisable(ogl.GL_SCISSOR_TEST);
+    ogl.glScissor(0, 0, @intCast(w), @intCast(backend.height));
+
+    // Start two pixels from the end of row 0 and read far enough to enter row
+    // 2: red, red, a whole row of green, then two blues.
+    const count: usize = w + 4;
+    const buf = try testing.allocator.alloc(u8, count * 4);
+    defer testing.allocator.free(buf);
+    try testing.expectEqual(count * 4, try backend.read((@as(u64, w) - 2) * 4, buf));
+
+    const head = [_][3]u8{ .{ 255, 0, 0 }, .{ 255, 0, 0 } };
+    for (head, 0..) |e, i| {
+        try testing.expectEqual(e[0], buf[i * 4 + 0]);
+        try testing.expectEqual(e[1], buf[i * 4 + 1]);
+        try testing.expectEqual(e[2], buf[i * 4 + 2]);
+    }
+    var i: usize = 2;
+    while (i < 2 + w) : (i += 1) {
+        try testing.expectEqual(@as(u8, 0), buf[i * 4 + 0]);
+        try testing.expectEqual(@as(u8, 255), buf[i * 4 + 1]);
+        try testing.expectEqual(@as(u8, 0), buf[i * 4 + 2]);
+    }
+    while (i < count) : (i += 1) {
+        try testing.expectEqual(@as(u8, 0), buf[i * 4 + 0]);
+        try testing.expectEqual(@as(u8, 0), buf[i * 4 + 1]);
+        try testing.expectEqual(@as(u8, 255), buf[i * 4 + 2]);
+    }
+}
+
+test "the shared window class is refcounted across backends" {
+    const base = classRefCount();
+
+    var first = try Backend.init(testing.allocator);
+    try testing.expectEqual(base + 1, classRefCount());
+    var second = try Backend.init(testing.allocator);
+    try testing.expectEqual(base + 2, classRefCount());
+
+    // One going away must not unregister the class the other still needs.
+    first.deinit();
+    try testing.expectEqual(base + 1, classRefCount());
+    second.deinit();
+    try testing.expectEqual(base, classRefCount());
+
+    // At zero the class is unregistered, so this has to register it again.
+    var third = try Backend.init(testing.allocator);
+    defer third.deinit();
+    try testing.expect(third.valid());
+    try testing.expectEqual(base + 1, classRefCount());
+}
+
+test "a second registration never re-consults the OS for the class" {
+    // The interleaving CodeRabbit found needs a registration to *observe* the
+    // class as already present -- and treat that observation as success -- while
+    // another thread is removing it. With a positive count the name is known to
+    // be registered, so this path must not call `RegisterClassExA` at all, and
+    // that call is the only way the observation can happen. The proof it did
+    // not call is that `ERROR_CLASS_ALREADY_EXISTS` is left unset.
+    var backend = try Backend.init(testing.allocator);
+    defer backend.deinit();
+
+    const held = classRefCount();
+    c.SetLastError(0);
+    try registerWindowClass();
+    const observed = c.GetLastError();
+    try testing.expectEqual(held + 1, classRefCount());
+    try testing.expect(observed != c.ERROR_CLASS_ALREADY_EXISTS);
+    releaseWindowClass();
+    try testing.expectEqual(held, classRefCount());
+
+    // The extra reference did not tear the class down under the backend.
+    try testing.expect(backend.valid());
+}
+
+test "the window class survives two threads creating and destroying backends" {
+    // The count that guards the class only means anything if register and
+    // release are serialised. With a bare atomic, one thread's final decrement
+    // can land between the other thread's "already registered, treat it as
+    // success" and its `CreateWindowExA`, which then finds no registered class
+    // and fails `init`. Two threads each living a backend's full lifetime is
+    // the shape that interleaving needs.
+    const Worker = struct {
+        var failed: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+
+        fn run() void {
+            var i: usize = 0;
+            while (i < 48) : (i += 1) {
+                var backend = Backend.init(std.heap.page_allocator) catch {
+                    failed.store(1, .seq_cst);
+                    return;
+                };
+                backend.deinit();
+            }
+        }
+    };
+    Worker.failed.store(0, .seq_cst);
+
+    const base = classRefCount();
+    const a = try std.Thread.spawn(.{}, Worker.run, .{});
+    const b = try std.Thread.spawn(.{}, Worker.run, .{});
+    a.join();
+    b.join();
+
+    // Neither thread saw init fail, and the count is back where it began.
+    try testing.expectEqual(@as(u8, 0), Worker.failed.load(.seq_cst));
+    try testing.expectEqual(base, classRefCount());
+
+    // And the class is still registered and usable afterwards.
+    var backend = try Backend.init(testing.allocator);
+    defer backend.deinit();
+    try testing.expect(backend.valid());
+}
+
+test "a second backend makes the first context not current" {
+    var first = try Backend.init(testing.allocator);
+    defer first.deinit();
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 8), try first.read(0, &buf));
+
+    var second = try Backend.init(testing.allocator);
+    defer second.deinit();
+
+    // WGL is thread-affine: creating the second context made it current, so the
+    // first must refuse rather than read whichever surface happens to be bound.
+    try testing.expectError(Error.GlContextLost, first.read(0, &buf));
+    try testing.expectEqual(@as(usize, 8), try second.read(0, &buf));
+}
+
+test "resize changes the surface reads address" {
+    var backend = try Backend.init(testing.allocator);
+    defer backend.deinit();
+    try testing.expectEqual(@as(u32, 256), backend.info().width);
+
+    backend.resize(64, 64);
+    const info = backend.info();
+    try testing.expect(info.valid);
+    try testing.expectEqual(@as(u32, 64), info.width);
+    try testing.expectEqual(@as(u32, 64), info.height);
+
+    const surface = @as(u64, info.width) * @as(u64, info.height) * 4;
+    var buf: [64]u8 = undefined;
+    try testing.expectEqual(@as(usize, 64), try backend.read(0, &buf));
+    // The new end is real, and so is the byte before it.
+    try testing.expectEqual(@as(usize, 16), try backend.read(surface - 16, &buf));
+    try testing.expectEqual(@as(usize, 0), try backend.read(surface, &buf));
+
+    // Shrinking and growing again both keep working.
+    backend.resize(32, 32);
+    try testing.expectEqual(@as(u32, 32), backend.info().width);
+    try testing.expectEqual(@as(usize, 0), try backend.read(32 * 32 * 4, &buf));
+    backend.resize(128, 128);
+    try testing.expectEqual(@as(u32, 128), backend.info().width);
+    try testing.expectEqual(@as(usize, 64), try backend.read(0, &buf));
+}
+
+test "read after deinit returns GlContextLost, and deinit is idempotent" {
+    var backend = try Backend.init(testing.allocator);
+    backend.deinit();
+    try testing.expect(!backend.valid());
+
+    var buf: [8]u8 = undefined;
+    try testing.expectError(Error.GlContextLost, backend.read(0, &buf));
+
+    // A second deinit must not underflow the shared window-class count.
+    const after_first = classRefCount();
+    backend.deinit();
+    try testing.expectEqual(after_first, classRefCount());
+
+    // And resize on a released backend is a no-op rather than a crash.
+    backend.resize(64, 64);
+    try testing.expect(!backend.valid());
 }

@@ -11,7 +11,7 @@ so a green run means both shipped binaries compile. The eleven tests the granule
 fault path added are unchanged; the one this branch adds is the OpenGL backend's
 contract pin, which is a compile-time assertion and so needs no display.
 
-`zig build gl-test` — **11/11 tests**, exit 0, and it is deliberately *not* in
+`zig build gl-test` — **23/23 tests**, exit 0, and it is deliberately *not* in
 `check`. It creates a real WGL context, so it needs a live WindowStation and
 hangs rather than fails without one -- the same reason the Vulkan probe is not in
 the gate. On this machine it passes; the GL backend's section below has the
@@ -1018,6 +1018,65 @@ Each fix has a test that fails without it, and the row-crossing one was checked
 the way this file checks every gate: the fix was reverted, the test went red on
 the green channel of the pixel from the second row, and restoring the fix made
 it pass again.
+
+### The read contract, stated exactly, because "drop-in" is the whole claim
+
+`read` serves offsets and lengths that are multiples of 4, and refuses anything
+else with `GlNotAligned` -- the two shapes `blockdev.read` refuses. An
+adversarial pass over the boundary cases the original eleven tests skipped
+(offsets and lengths of 1, 2 and 3 mod 4; a zero-length buffer; an offset exactly
+at the surface end and past it; the largest aligned offset there is; a length far
+larger than the surface; a buffer whose base pointer is not 4-byte aligned; and a
+read crossing two row boundaries) found exactly one defect left: an unaligned
+offset was silently rounded down to the containing pixel, returning bytes shifted
+by one to three and reporting success, and near the end of the surface it could
+return more bytes than remained. `blockdev`'s own header names silent truncation
+as the thing its unaligned helpers exist to avoid, so the backend refuses
+instead. The guard was checked by reverting it and watching both cases go red.
+
+The byte count means "bytes actually read": a short count is the surface ending
+inside the request, an aligned offset at or past the end is a clean 0, and a
+zero-length buffer is 0 before anything else is considered. An unaligned base
+pointer is *not* rejected -- `GL_PACK_ALIGNMENT` governs the stride between rows,
+not the base address -- and a test asserts the bytes are correct from an
+unaligned window rather than only that the count is right.
+
+What the pass could not exercise: `init`'s failure unwinding has no injection
+point, so no test forces `GetDC`/`ChoosePixelFormat`/`wglCreateContext` to fail on
+demand; what is asserted instead is the observable invariant, that the shared
+window-class count returns to its baseline across init/deinit cycles and across
+two live backends. The `glGetError` drain loop before a read is unbounded in
+theory but cannot loop forever on a context that is not robustness-enabled, and
+nothing here can force the driver into that state.
+
+### The window class is process-global, so register and release are one step
+
+CodeRabbit's second round -- one finding, on the registry this pass rewrote -- is
+a real race, not a nit. A window class is process-global, and the earlier fix
+guarded it with a bare atomic counter: `register` was *read, register, add* and
+`release` was *subtract, test, unregister*. Neither pair is atomic as a pair, so
+this interleaving loses the class: thread A's last `fetchSub` returns 1; before A
+calls `UnregisterClassA`, thread B calls `RegisterClassExA`, gets
+`ERROR_CLASS_ALREADY_EXISTS`, treats that as success and increments; A then
+unregisters; B's `CreateWindowExA` finds no registered class and `init` fails.
+
+The fix holds one lock across register, unregister and the count, and calls the
+OS only on the 0 -> 1 transition (a positive count already means the name is
+registered, so a sibling just takes a reference). `std.Thread.Mutex` is gone in
+this toolchain and `std.Io.Mutex` needs an `Io` the backend does not have, so the
+lock is `std.atomic.Mutex`, the std spinlock -- the critical section is two short
+Win32 calls taken at most twice in a backend's life.
+
+The falsifier is deterministic: with the count positive, a second registration
+must not consult the OS at all, proven by `ERROR_CLASS_ALREADY_EXISTS` being left
+unset (the failed `RegisterClassExA` is the only thing that sets it). Reverting to
+the atomic pair turns that test red; restoring the lock turns it green. There is
+also a two-thread stress test -- two threads each living a backend's whole
+lifetime 48 times, asserting neither `init` failed and the count returned to
+baseline -- but it passes on the atomic version too, so it is a lifecycle guard,
+not the proof: the race window is a few instructions wide and the pass could not
+force it even at 1600 context cycles. The guarantee is mutual exclusion; the
+stress test only shows the concurrent path is exercised and balanced.
 
 ### The MinGW translate-c workarounds, itemised
 
