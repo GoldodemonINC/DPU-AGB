@@ -13,7 +13,7 @@ that could not be measured yet are marked as predictions rather than results.
 
 | Gate | Result |
 |---|---|
-| `zig build check` | **17/17 steps, 140/140 tests, exit 0** |
+| `zig build check` | **17/17 steps, 151/151 tests, exit 0** |
 | `zig build probe` | **61/61 checks, exit 0**, no Vulkan loader warnings |
 | `zig fmt --check` | clean |
 

@@ -28,6 +28,7 @@ const std = @import("std");
 const win = @import("win");
 const blockdev = @import("blockdev");
 const tiers = @import("tiers");
+const residency = @import("residency");
 
 /// Largest the pool is allowed to grow. A stop, not a reservation: the pool
 /// grows on demand as blocks are actually written.
@@ -76,6 +77,32 @@ pub const Pool = struct {
     /// bouncing wrapper when the caller's buffer cannot satisfy it.
     pub fn read(self: *Pool, offset: u64, buf: []u8) !usize {
         return self.dev.readUnaligned(offset, buf);
+    }
+
+    /// The granule fault path over this pool's bytes.
+    ///
+    /// `Pool.read` is a pass-through: it does exactly what it is asked and
+    /// leaves the caller to notice that a 4 KiB read costs a 36.5 us round trip
+    /// however fast the volume is. This is the other interface -- a miss fetches
+    /// a whole granule and the rest of it is served from RAM, which is the
+    /// measured 5.4x. It is a separate call rather than a flag on `read`
+    /// because the two have different costs: a fault path holds
+    /// `capacity_bytes` of RAM resident for as long as it lives, and that is
+    /// not a decision to make by accident on behalf of every caller.
+    pub const Faults = residency.Faults(blockdev.BlockDevice);
+
+    /// Build a fault path bound to this pool.
+    ///
+    /// The returned path borrows `self.dev`, so the pool must outlive it and
+    /// must not be copied or moved while it is alive. `Pool.init` returns by
+    /// value, which is exactly the case where that matters: initialise the
+    /// pool, store it, and only then call this.
+    pub fn faults(
+        self: *Pool,
+        allocator: std.mem.Allocator,
+        config: Faults.Config,
+    ) !Faults {
+        return Faults.init(allocator, &self.dev, config);
     }
 
     /// Write at an offset, growing the pool as needed.

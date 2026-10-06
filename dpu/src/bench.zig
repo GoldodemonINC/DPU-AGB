@@ -210,7 +210,7 @@ pub fn main() !void {
     // Optional because the sweep can fail: an unavailable grant or a short read
     // must not take the benchmark down, it must take the *plan* down, so the
     // numbers that did come back are still printed beside a named reason.
-    const machine: ?residency.Machine = measureGranules(&dev, cold_stream_mbps, headroom) catch |e| blk: {
+    const machine: ?residency.Machine = measureGranules(gpa, &dev, cold_stream_mbps, headroom) catch |e| blk: {
         std.debug.print("\n  granule sweep failed: {s}\n\n", .{@errorName(e)});
         break :blk null;
     };
@@ -313,7 +313,12 @@ fn sweep(dev: *blockdev.BlockDevice, mib: u64) !SweepResult {
 /// of adjacent faults. A scheduler that faults 4 KiB at a time is bounded by
 /// the first column and simply cannot reach the second, which is the whole
 /// reason residency policy is about granules and not only about bytes.
-fn measureGranules(dev: *blockdev.BlockDevice, cold_mbps: f64, headroom: u64) !residency.Machine {
+fn measureGranules(
+    gpa: std.mem.Allocator,
+    dev: *blockdev.BlockDevice,
+    cold_mbps: f64,
+    headroom: u64,
+) !residency.Machine {
     const MiB: u64 = 1024 * 1024;
     const one: u64 = MiB;
 
@@ -379,6 +384,8 @@ fn measureGranules(dev: *blockdev.BlockDevice, cold_mbps: f64, headroom: u64) !r
         if (g == one) stream_mbps = mbps;
     }
 
+    try measureFaultPath(dev, gpa, @min(total, 256 * MiB));
+
     // Planned against the *lower* of the two streaming figures. This pass reads
     // a region it just wrote, so it is partly controller-cached and reads fast;
     // the sweep above does not, and the difference is real rather than noise.
@@ -419,6 +426,76 @@ fn measureGranules(dev: *blockdev.BlockDevice, cold_mbps: f64, headroom: u64) !r
         .stream_mbps = planned_stream,
         .pool_bytes = usable_capacity,
     };
+}
+
+/// Walk a region through the shipped fault path at two granules.
+///
+/// The granule table above measures the *device* at several transfer sizes.
+/// That is a different claim from "the code gets the benefit", and only this
+/// function measures the second: a fault path could read a granule on a miss
+/// and immediately throw it away, leaving the table above entirely unchanged
+/// while the thing the client actually calls did nothing. So this walks the
+/// same materialised region, in the same 4 KiB steps a client would issue,
+/// through `residency.Faults` itself, and reports what it gets.
+///
+/// The walk is bounded at 256 MiB rather than run over the whole region: at a
+/// 4 KiB granule this is 65536 faults, and running it over 4 GiB would put
+/// forty seconds of the benchmark into proving a point that 256 MiB already
+/// proves. Both granules get the same bytes and the same resident budget, so
+/// the only variable is the fault size -- which is the entire claim.
+fn measureFaultPath(dev: *blockdev.BlockDevice, gpa: std.mem.Allocator, span: u64) !void {
+    const step: u64 = 4096;
+    if (span < step) return;
+
+    std.debug.print(
+        \\
+        \\  fault path -- {d:.0} MiB walked in 4 KiB reads, whole walk resident
+        \\
+        \\    granule   faults      MB/s   hit rate   evictions   round trips
+        \\    -----------------------------------------------------------
+        \\
+    , .{@as(f64, @floatFromInt(span)) / 1024.0});
+
+    for ([_]u64{ 4096, 1024 * 1024 }) |g| {
+        var faults = try residency.Faults(blockdev.BlockDevice).init(gpa, dev, .{
+            .granule = g,
+            // The whole walk fits, so the comparison isolates the fault size
+            // and does not quietly measure eviction as well. A path that
+            // thrashes would be a different -- and separately interesting --
+            // experiment.
+            .capacity_bytes = span,
+        });
+        defer faults.deinit();
+
+        var buf = try blockdev.AlignedBuffer.alloc(@intCast(step));
+        defer buf.free();
+
+        // Flushed before the walk so each row starts from the same state, and
+        // the row that runs second is not reading bytes the first row warmed.
+        dev.flush();
+
+        const t0 = tickUs();
+        var off: u64 = 0;
+        while (off < span) : (off += step) {
+            const n = try faults.read(off, buf.bytes);
+            if (n != step) return error.ShortRead;
+        }
+        const mbps = rate(span, usSince(t0));
+
+        const s = faults.stats();
+        std.debug.print(
+            "  {d:>8}  {d:>7}  {d:>10.1}  {d:>9.3}  {d:>10}  {d:>12}\n",
+            .{ g, s.misses + s.prefetched, mbps, s.hitRate(), s.evictions, s.misses + s.prefetched },
+        );
+    }
+
+    std.debug.print(
+        \\
+        \\  The row above is not a device figure: it is what residency.Faults
+        \\  actually returns. The granule is the whole difference.
+        \\
+        \\
+    , .{});
 }
 
 /// Free space on the volume the pool lives on, or 0 when it cannot be read.

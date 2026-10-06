@@ -5,14 +5,36 @@ applications as a discrete GPU through a user-mode installable client driver.
 
 ## Status at this commit
 
-`zig build check` — **140/140 tests**, exit 0, `zig fmt --check` clean. The gate
-also builds `dpu.exe` and `dpubench`, so a green run means both shipped
-binaries compile.
+`zig build check` — **152/152 tests** (19/19 steps), exit 0, `zig fmt --check`
+clean, run on a throwaway cache. The gate also builds `dpu.exe` and `dpubench`,
+so a green run means both shipped binaries compile. The eleven tests the granule
+fault path added are unchanged; the one this branch adds is the OpenGL backend's
+contract pin, which is a compile-time assertion and so needs no display.
+
+`zig build gl-test` — **24/24 tests**, exit 0, and it is deliberately *not* in
+`check`. It creates a real WGL context, so it needs a live WindowStation and
+hangs rather than fails without one -- the same reason the Vulkan probe is not in
+the gate. On this machine it passes; the GL backend's section below has the
+detail, including the test that proves a real `glReadPixels` ran and the two
+that pin the read-path fixes the CodeRabbit review forced.
 
 `zig build probe` — **61/61, exit 0**, closing with
 `PROBE_SUMMARY: total=61 passed=61 failed=0 result=PASS` and
 `RESULT: PASS -- the DPU heap carries real bytes on disk`, and with **no loader
 warnings at all** under `VK_LOADER_DEBUG=error,warn`.
+
+`zig build bench` — **fails on this machine, and not because of this branch.**
+It aborts with `PoolOutOfSpace` at the 4096 MiB sweep row with 6.26 GiB free on
+`P:`. This was measured rather than assumed: `origin/main` in a clean worktree
+fails at the same row, with the same error and the same exit 1, and the two logs
+are identical on every volume and error line. It is a real latent bug in the
+sweep — the headroom budget is taken once, before the first row, so by the last
+row it is stale by every byte the earlier rows committed, and a row can pass the
+bench's check and then lose the whole run inside `ensureRoom`, which is the
+opposite of the "drop the row and carry on" the code around it promises. Left
+unfixed here on purpose: the sweep is not what this change is about, and
+quietly skipping rows to make a benchmark green is how a benchmark stops
+meaning anything.
 
 Every number here was measured on this machine for this tree. An earlier copy of
 this file claimed the probe was 45/45; that was stale, and a number nobody re-ran
@@ -38,10 +60,40 @@ is worse than no number.
 | `14700fe` | #12 | Make a fresh Windows clone able to pass the gate |
 | `71a3455` | #13 | Measure route 1: serving llama.cpp's weights from the DPU pool |
 | `5232655` | #16 | Revert the wrong ABI fix, land residency on top, and stop the pool leaking disk |
+| `454d34b` | #17 | Add the missing root README, and correct the stale claims in dpu's |
+| `bc33558` | #18 | Spend the granule: a fault path that reads it, not just prices it |
+| `cd1dc8a` | #19 | Read the granule from the GPU: an OpenGL backend, and the pin that proves it fits |
 
 #14 and #15 were closed without merging; #16 replaced both, based directly on
-`main` with no stacked dependency. **#17 is the only open PR**, carrying the root
-README and the corrections to `dpu/README.md`.
+`main` with no stacked dependency. #17 merged at `454d34b`.
+
+**#19 is merged, and #18 is open and now carries it.** #19 was the OpenGL read
+backend, opened against `feat/granule-fault-path` rather than `main` because its
+contract pin instantiates `residency.Faults`, which #18 introduces -- targeting
+`main` would have put #18's 865 lines into a PR about the GL work. It was
+**squash-merged into `feat/granule-fault-path` at `cd1dc8a`**, so the branch PR
+#18 targets `main` from already contains the backend, and #18 is what lands it on
+`main`. The stacked base was therefore resolved by merging into the stack rather
+than by retargeting, and there is nothing left to retarget: #18's head is
+`cd1dc8a`. Auto-merge was never enabled on #19.
+
+**A stacked base costs the automatic review, and this was not known until it
+happened.** The repository's automated reviewer is **CodeRabbit** (the
+`coderabbitai[bot]` account), not Greptile. Its automatic review is disabled on
+any base branch that is not the default, so #19 -- based on
+`feat/granule-fault-path` -- was opened and immediately answered with
+`Review skipped: Auto reviews are disabled on base/target branches other than the
+default branch`. A single review was triggered with `@coderabbitai review`
+instead, which is the command the skip message itself names. That engages the
+gate without changing the diff; the alternatives were worse -- targeting `main`
+would put #18's 865 lines into a PR about the OpenGL backend, and adding a
+`.coderabbit.yaml` to allow non-default bases is a change to the repository's
+review policy, which is the owner's call rather than this branch's.
+
+**The lesson mirrors the one about pushes.** "The PR is open" is not the same as
+"the PR is being reviewed"; the review tool declined in a comment, and a process
+that only checked that the PR existed would have waited forever for feedback that
+was never coming.
 
 **Every one of #5 to #10 is now merged**, along with #11, #12 and #13. The linear
 stack they were blocked on resolved in the order it was predicted to: #8, then
@@ -751,6 +803,10 @@ referred to as "the residency scheduler" since before it existed. It is policy
 and arithmetic only: it imports nothing from the backend, holds no handles, and
 is tested as arithmetic rather than against a device.
 
+That last sentence used to be the whole story, and it was the wrong story: a
+module that decides *what* to keep resident, with nothing that ever asks it,
+is arithmetic. The granule is now spent rather than only priced.
+
 Three findings are encoded as behaviour rather than as comments:
 
 1. **LRU earns literally nothing on a cyclic scan.** A decoder's access pattern
@@ -777,6 +833,327 @@ bytes, adds a copy, and changes nothing about the access pattern. Route 1 did
 exactly that and measured the result. What the DPU can contribute is the *fault
 path* -- granule, read-ahead, eviction policy and the honest numbers above --
 applied to the file the model already lives in.
+
+## The granule is now a read path, and not a table
+
+For as long as the 5.4x figure has existed it has been a row in a benchmark
+table and a third argument to `plan`. Nothing in the read path ever took one.
+A fault path could have been written that read a whole granule on a miss and
+then dropped it, and every number in this file would have been unchanged --
+which is exactly the gap that let the hardcoded `0.08` and the probe count go
+stale twice.
+
+`residency.Faults(Backend)` is that read path. It is a scheduler-backed cache
+that fetches a whole granule on a miss and serves the rest of it from RAM:
+
+```zig
+const F = residency.Faults(blockdev.BlockDevice);
+var faults = try F.init(allocator, &pool.dev, .{
+    .granule = 64 * 1024,     // the policy the table was measuring
+    .capacity_bytes = ...,    // what stays resident
+    .read_ahead = ...,        // `PowerMode.prefetchDepth`
+});
+const n = try faults.read(offset, buf);
+```
+
+`Backend` is a comptime parameter rather than a stored pointer, so the error
+set stays inferred from the backend instead of erased to `anyerror`, and
+`residency` still imports nothing from the backend and is still testable with
+no device present. `Scheduler` gained one accessor, `slotOf`, because a fault
+path owns the bytes and needs to know which slot they are in; `access` and
+`load` answer only "is it resident", which is the question the policy is about.
+
+Four rules, each of which was a bug first:
+
+1. **A request at least as large as the granule bypasses the cache.** It is
+   already fault-sized; buffering it allocates a slab the caller immediately
+   overwrites and reports misses for reads that were never inefficient.
+2. **A short fetch is remembered as a short granule.** The tail past the end of
+   the working set is zeroed, `valid` is what gates the copy, and a later read
+   in that same granule is still a *hit* -- the bytes really are resident, they
+   just stop short.
+3. **The demand is served before read-ahead is fetched.** A speculative fetch
+   that fails is counted in `stats().skipped` and never takes the demand down
+   with it. An optimisation that can fail a read is not one.
+4. **The granule is a validated policy.** Zero, non-power-of-two, or below a
+   sector is refused with `InvalidGranule`, because `offset / granule` has to be
+   a shift and every granule in the slab has to inherit the slab's alignment.
+
+`pool.zig` exposes it as `Pool.faults()` and `Pool.Faults`, deliberately as a
+separate call rather than a flag on `Pool.read`: a fault path holds
+`capacity_bytes` of RAM resident for as long as it lives, and that is not a
+decision to make by accident on behalf of every caller.
+
+### The measured claim, reduced to arithmetic
+
+Eleven tests cover the fault path, and one of them is the benchmark's claim as
+a thing that can be checked by anyone: walk 256 KiB in 4 KiB reads at a 4 KiB
+granule and at a 64 KiB granule, and the backend is asked for **64 times versus
+4**, with **the same 262144 bytes** either way. That is the whole of the 5.4x --
+not a throughput model, a count of round trips.
+
+The other ten pin the parts that are easy to get quietly wrong: the short tail,
+the bypass, eviction observed through the map rather than the counter, read-ahead
+stopping at a known extent, and a read-ahead failure leaving the demand intact.
+
+`bench.zig` grew `measureFaultPath`, which walks a real region through the
+shipped path at two granules so the figure is a property of this code rather
+than of the device. **It has not been run**: the benchmark aborts at the 4096
+MiB sweep row before reaching it, on this branch and on `origin/main` alike.
+It compiles and is wired into `measureGranules`, and it is the first thing to
+run once the volume has room for the sweep.
+
+## The fault path's backend is now a real device, not just the pool
+
+`residency.Faults(Backend)` was written against `blockdev.BlockDevice` and had
+only ever run against it and against a `FakeBackend` in its own tests. `Backend`
+is a comptime parameter, so any type exposing
+`read(self: *Backend, offset: u64, buf: []u8) !usize` qualifies -- but that is a
+contract nobody had ever instantiated against a *second real device*.
+
+`dpu/src/backend/gl.zig` is that second device. It creates a hidden WGL context
+on the host's GPU and reads the framebuffer with `glReadPixels`, so a granule is
+one call into video memory instead of 4 KiB at a time through the disk pool:
+
+```zig
+const F = residency.Faults(gl.Backend);
+var backend = try gl.Backend.init(allocator);
+var faults = try F.init(allocator, &backend, .{ .granule = 64 * 1024, ... });
+```
+
+**What it is.** A read backend and nothing else. No swapchain, no shader, no
+present, no video-memory allocation. It registers a window class, creates a
+hidden window and a WGL context of its own, and clears that context's
+framebuffer to black; the bytes `read` returns come from *that* surface and
+nowhere else -- not the host's desktop, not another program's render, and not
+model weights. A caller that wants real data has to put real data in the surface
+first. `read` treats the byte offset as a row-major RGBA pixel offset (4 bytes
+per pixel), returns the pixels in linear order even across a row boundary, and
+returns the byte count actually read, which is short at the edge of the surface.
+That short tail is the same shape the fault path already handles for the pool's
+last granule, which is why it is a drop-in.
+
+**What it is not.** A replacement for the Vulkan ICD, and not a reader of
+somebody else's GL context. The ICD owns a device-local heap backed by the disk
+pool; this reads a framebuffer that belongs to a window it created itself. The
+early draft of this file said "the host's existing GL context", which is wrong
+and would lead a caller to expect existing application pixels; the review caught
+it and it is corrected here, in `gl.zig` and in `build.zig`. Different devices
+for different purposes, and the fault path can be backed by either.
+
+### The claim is a compile error if it stops being true
+
+`gl.zig`'s header claims it is a drop-in for `residency.Faults(GLBackend)`. An
+interface claim whose only assertion is prose rots the moment either side moves.
+`dpu/src/backend/gl_contract_test.zig` instantiates the *real* fault path over
+the *real* backend and takes the address of its entry points, which forces Zig to
+analyse their bodies against `gl.Backend`. It is a type-level fact, so it needs
+no display, so it lives in `zig build check` rather than behind `gl-test`.
+
+It was checked that the pin can go red, because a pin that cannot fail proves
+nothing. Changing `read`'s offset from `u64` to `u32` -- a change `gl.zig`'s own
+tests do *not* notice, because they pass `u32`-sized literals -- produces
+`error: expected type 'u32', found 'u64'` at `residency.zig:692`, reported
+against the contract module, with `check` at exit 1. Restoring the signature
+returns it to green.
+
+### Independence, stated because it was measured rather than assumed
+
+The backend's implementation does not depend on the granule branch that
+introduces `residency.Faults`. Its only imports are `std` and `win`. In a
+worktree detached at `origin/main`, with `gl.zig` and the `build.zig` wiring
+copied in, `zig build gl-test` is **8/8, exit 0** -- the drop-in works against
+`main` even though the fault path it targets does not exist there yet. What does
+depend on the granule branch is the contract pin, for the trivial reason that
+`residency.Faults` is the thing being pinned: that same worktree's
+`zig build check` fails with exactly one error, `residency has no member named
+'Faults'`. Hence the stacked base recorded above.
+
+### The live tests read real pixels, and one of them proves it
+
+`gl-test` creates a real context, so its tests cannot run at all without a GPU --
+but "cannot run without GL" is not the same as "proves GL returned the data".
+The all-zero test cannot tell a real `glReadPixels` from a buffer that merely
+stayed `undefined`, because a cleared-to-black framebuffer and untouched memory
+are both zero. A new test clears the framebuffer to `(0.25, 0.5, 0.75, 1.0)` and
+asserts the channels come back as `64, 128, 191, 255` within +/-2, which
+undefined memory cannot produce. Partial-edge reads (byte 262140 returning 4, not
+8) and 4 KiB-aligned reads are covered as well.
+
+### The review found four real defects in the read path
+
+CodeRabbit's review of PR #19 changed the backend, and the read path is the part
+worth recording, because its bugs were silent -- each returned a plausible byte
+count with the wrong bytes behind it.
+
+1. **A read is linear; `glReadPixels` reads a rectangle.** A range that started
+   at the last pixel of a row and continued into the next returned the last
+   *column* of two rows, not the end of one row followed by the start of the
+   next. `read` now issues one call per row when the range does not line up with
+   rows, and keeps the single-call fast path for reads that start on a row
+   boundary and cover whole rows -- which is every granule-aligned fault.
+2. **An offset past the end of the surface underflowed `height - py`** and
+   trapped in a safety-checked build instead of returning "nothing to read". The
+   fault path's read-ahead can ask past the end of a finite working set, so this
+   was reachable rather than theoretical.
+3. **The current-context check ran *after* the GL calls it guards.** WGL routes
+   GL calls to whatever context is current on the calling thread, so a check
+   that runs afterwards has already read the wrong surface. It is now the first
+   thing `read` does.
+4. **`glReadPixels` failures were invisible.** A GL error left the buffer
+   untouched and the old code still returned a byte count. There is now a
+   `glGetError` check that returns `GlReadFailed`, because a silent wrong byte
+   count is the one failure the fault path cannot detect.
+
+Three more were lifecycle rather than data. The window was
+`WS_OVERLAPPEDWINDOW`, whose client area -- the actual drawable -- is smaller
+than the `256x256` the backend advertised, so `read` addressed rows and columns
+that did not exist; it is now `WS_POPUP` with the size read back from
+`GetClientRect`. The window class is process-global, so a second backend in the
+same process failed to initialise and a sibling's `deinit` unregistered the
+class out from under a live one; a refcount now shares it and releases it only
+when the last backend goes. And a failed `init` leaked the window and its DC;
+`errdefer` now unwinds what it acquired.
+
+Each fix has a test that fails without it, and the row-crossing one was checked
+the way this file checks every gate: the fix was reverted, the test went red on
+the green channel of the pixel from the second row, and restoring the fix made
+it pass again.
+
+### The read contract, stated exactly, because "drop-in" is the whole claim
+
+`read` serves offsets and lengths that are multiples of 4, and refuses anything
+else with `GlNotAligned` -- the two shapes `blockdev.read` refuses. An
+adversarial pass over the boundary cases the original eleven tests skipped
+(offsets and lengths of 1, 2 and 3 mod 4; a zero-length buffer; an offset exactly
+at the surface end and past it; the largest aligned offset there is; a length far
+larger than the surface; a buffer whose base pointer is not 4-byte aligned; and a
+read crossing two row boundaries) found exactly one defect left: an unaligned
+offset was silently rounded down to the containing pixel, returning bytes shifted
+by one to three and reporting success, and near the end of the surface it could
+return more bytes than remained. `blockdev`'s own header names silent truncation
+as the thing its unaligned helpers exist to avoid, so the backend refuses
+instead. The guard was checked by reverting it and watching both cases go red.
+
+The byte count means "bytes actually read": a short count is the surface ending
+inside the request, and an aligned offset at or past the end is a clean 0. A
+zero-length buffer returns 0 before the alignment and context checks -- but only
+once the backend has a context: a released or never-initialised backend returns
+`GlContextLost` for a zero-length read, because the missing context is checked
+first. An unaligned base
+pointer is *not* rejected -- `GL_PACK_ALIGNMENT` governs the stride between rows,
+not the base address -- and a test asserts the bytes are correct from an
+unaligned window rather than only that the count is right.
+
+What the pass could not exercise: `init`'s failure unwinding has no injection
+point, so no test forces `GetDC`/`ChoosePixelFormat`/`wglCreateContext` to fail on
+demand; what is asserted instead is the observable invariant, that the shared
+window-class count returns to its baseline across init/deinit cycles and across
+two live backends. The `glGetError` drain loop before a read is unbounded in
+theory but cannot loop forever on a context that is not robustness-enabled, and
+nothing here can force the driver into that state.
+
+### The window class is process-global, so register and release are one step
+
+CodeRabbit's second round -- one finding, on the registry this pass rewrote -- is
+a real race, not a nit. A window class is process-global, and the earlier fix
+guarded it with a bare atomic counter: `register` was *read, register, add* and
+`release` was *subtract, test, unregister*. Neither pair is atomic as a pair, so
+this interleaving loses the class: thread A's last `fetchSub` returns 1; before A
+calls `UnregisterClassA`, thread B calls `RegisterClassExA`, gets
+`ERROR_CLASS_ALREADY_EXISTS`, treats that as success and increments; A then
+unregisters; B's `CreateWindowExA` finds no registered class and `init` fails.
+
+The fix holds one lock across register, unregister and the count, and calls the
+OS only on the 0 -> 1 transition (a positive count already means the name is
+registered, so a sibling just takes a reference). `std.Thread.Mutex` is gone in
+this toolchain and `std.Io.Mutex` needs an `Io` the backend does not have, so the
+lock is `std.atomic.Mutex`, the std spinlock -- the critical section is two short
+Win32 calls taken at most twice in a backend's life.
+
+The falsifier is deterministic: with the count positive, a second registration
+must not consult the OS at all, proven by `ERROR_CLASS_ALREADY_EXISTS` being left
+unset (the failed `RegisterClassExA` is the only thing that sets it). Reverting to
+the atomic pair turns that test red; restoring the lock turns it green. There is
+also a two-thread stress test -- two threads each living a backend's whole
+lifetime 48 times, asserting neither `init` failed and the count returned to
+baseline -- but it passes on the atomic version too, so it is a lifecycle guard,
+not the proof: the race window is a few instructions wide and the pass could not
+force it even at 1600 context cycles. The guarantee is mutual exclusion; the
+stress test only shows the concurrent path is exercised and balanced.
+
+### A destroyed backend must not unmake a live sibling's context
+
+An audit over the real GL surface found one more defect in the same shape as the
+read bugs: behaviour that is fine with one backend and wrong with two. WGL keeps
+at most one *current* context per thread, shared by every backend on that thread,
+so a backend's context being non-null does not mean it is the current one.
+`destroyContext` called `wglMakeCurrent(dc, null)` unconditionally, and that call
+releases whichever context is current on the thread -- so the ordinary sequence
+create `a`, create `b` (now current), `a.deinit()` left `b.read` returning
+`GlContextLost` even though `b` was alive and untouched. The survivor of a
+teardown silently lost its context membership.
+
+The fix is one guard: `destroyContext` clears the thread's current context only
+when `wglGetCurrentContext()` is this backend's own. The invariant is stated on
+`Backend.ctx` -- the field that owns the context -- and repeated at the one place
+allowed to unmake membership, so a later change cannot reintroduce it without
+contradicting the comment it edits. It is the second of only two places that may
+act on the membership; the other is `read`, which checks it before trusting the
+surface.
+
+The regression test is falsifiable and was checked that way: against the
+unfixed `destroyContext` it fails with `error.GlContextLost` at the surviving
+`b.read`, and after the guard it passes. `gl-test` is 24 tests.
+
+### Acknowledged open items from the audit
+
+An audit of this branch (not acted on here, recorded so they are not rediscovered)
+raised these, in descending value:
+
+- `check` on plain `main` is still red until #18 lands: the contract pin needs
+  `residency.Faults`, which #18 introduces. #19 has already squash-merged into
+  #18's branch at `cd1dc8a`, so #18 is now the only thing between the backend and
+  `main`.
+- Nothing routes a granule read through the backend, so the claim that one
+  `glReadPixels` per granule beats the pool has no measured number.
+- `resize`, `Info`/`info()`, `valid()`, `last_error` and `pub const Error` have no
+  consumer outside `gl.zig`; the only client, `residency.Faults`, uses
+  `read`/`init`/`deinit`. They are additive surface, not required by the
+  backend's job.
+- The registry race's regression test asserts an implementation detail (that no
+  `RegisterClassExA` is attempted) and the two-thread stress test passes on the
+  unfixed atomic code, so a *different* racy reimplementation would slip past
+  both.
+- A failed `resize` leaves the new `width`/`height` in place with `ctx == null`,
+  so `info()` reports a surface that does not exist; untested.
+- `gl.zig` carries the registry, the context lifecycle, the read and every test
+  in one file; the repo already splits test modules elsewhere.
+
+### The MinGW translate-c workarounds, itemised
+
+Zig 0.16's translate-c of the MinGW headers does not yield a usable `GL/wgl.h`,
+so four workarounds are in the file. They are the part a reviewer cannot infer
+from the code, so each is deliberate and named here:
+
+- **`_FORTIFY_SOURCE=0` via `addCMacro`**, the same mitigation `win_mod` already
+  carries, because the GL header pulls in the same broken inline fortify
+  wrappers that made release builds fail.
+- **A local `const GLsizei = i32`**, because the translated `GL/gl.h` does not
+  expose `GLsizei` at all.
+- **`ogl.glPixelStorei`, not `c.glPixelStorei`**, because the GL entry points
+  land in the `@cImport` namespace, not in `win`'s.
+- **Raw resource IDs instead of their names.** `IDI_APPLICATION`, `IDC_ARROW`
+  and `COLOR_WINDOW` are MinGW macros of the form `func##A`, which translate-c
+  cannot resolve (`undefined identifier 'A'`). `LoadIconA`/`LoadCursorA` are
+  handed `@ptrFromInt(@as(usize, 32512))` and the window class's background brush
+  is left `null`. These are the values in `winuser.h`, written as integers so the
+  broken macro path is never generated.
+
+The translated `PIXELFORMATDESCRIPTOR` also drops the four `cAccum*Shift` fields
+the canonical Win32 struct has, so the struct literal is trimmed to the fields
+the header actually defines. None of these change behaviour; they are the cost of
+`@cImport`ing a GL header on this toolchain.
 
 ## Unlinking the pool did not give the space back, and it was not NTFS
 
@@ -939,32 +1316,55 @@ That list is now closed: `vkEnumerateInstanceVersion` is implemented, the loader
 confirms the manifest's 1.3, and the interface version moved to 5 to match. See
 the section on the loader/ICD handle contract above.
 
-0. **Wire the residency scheduler to a real fault path.** It exists, it is
-   tested, and nothing calls it yet -- `prefetchDepth` is now a page count for
-   `residency.Scheduler.read_ahead` rather than a display value, but no client
-   faults through it. Until one does, the plan table is a prediction and not a
-   measurement, and the difference matters.
-1. **Retire #5, #6 and #7.** They are fully contained in #8. Closing them is the
+0. ~~**Wire the residency scheduler to a real fault path, over a real device.**~~
+   **Done, with one honest gap.** `residency.Faults(Backend)` is a real read
+   path: a miss fetches a whole granule, the rest is served from RAM, and
+   `Pool.faults()` exposes it over the real block device. It now has a *second*
+   real backend too -- `gl.zig`, a WGL read backend over the host's framebuffer --
+   and `gl_contract_test.zig` turns its "drop-in" claim into a compile error if
+   it stops holding. **The gap is that neither one has a production client.**
+   The benchmark's `measureFaultPath` and the tests exercise them, but the ICD
+   reads through `blockdev` directly and nothing in the engine calls
+   `Pool.faults`. So the plan table is still a *prediction*; what is no longer a
+   prediction is the granule, which is now a counted round-trip saving rather
+   than a device row. **The next task is the one this gap names: route a real
+   read through the fault path** -- the engine's weight loader or the ICD's copy
+   path -- and measure it, because until then the fault path and the GL backend
+   are both verified mechanisms with no caller.
+1. **Fix the sweep's stale headroom budget.** The benchmark takes its headroom
+   once, before the first row, and every row then commits its bytes to the same
+   volume -- so the last row is sized against a budget that is out of date by
+   everything before it. On a volume with 6.26 GiB free that is the difference
+   between printing a partial curve and dying with `PoolOutOfSpace`, and it
+   costs the whole run including every row that already succeeded. Reproduced on
+   `origin/main`, so it is not new. The fix is to re-read free space per row
+   and subtract the pool's own extent, not to widen the reserve or skip rows.
+2. **Run the 9B at 64k end to end.** It still has never been executed. Every
+   number in that section is `residency.plan` arithmetic over measured device
+   constants, not a measurement of a model generating tokens. At the rate the
+   plan predicts it is hours, which is exactly why it needs doing on a machine
+   that is not the one doing the work.
+3. **Retire #5, #6 and #7.** They are fully contained in #8. Closing them is the
    user's call, not the agent's.
-2. **Multi-segment pool** — the tier resolver sums free space across roots and
+4. **Multi-segment pool** — the tier resolver sums free space across roots and
    holds `RESERVE_BYTES` per volume (PR #1), but the pool is still a single file
    on a single volume, so nothing is gained on disk yet.
-3. **Process-level pool locking test** — existing tests prove a *thread* releases
+5. **Process-level pool locking test** — existing tests prove a *thread* releases
    `Local\DPU.pool.lock`; none proves two *processes* cannot corrupt `pool.vram`.
-4. **Run the benchmark in CI.** Every number above is from one run on one machine.
+6. **Run the benchmark in CI.** Every number above is from one run on one machine.
    Nothing re-measures it, so the next edit can quietly make it stale the way the
    hardcoded `0.08` did — as the probe count already did once.
-5. **Extend the wire suite where the claims are still unchecked.** It covers
+7. **Extend the wire suite where the claims are still unchecked.** It covers
    every route the dashboard can reach, and nothing else: there is no route yet
    that takes a body, no keep-alive, and no concurrent client. Each of those is
    a claim someone will eventually make, and the suite should already be red when
    they start.
-6. **Assert the `buffer` values, not just its keys — on the write path.** The
+8. **Assert the `buffer` values, not just its keys — on the write path.** The
    sixteen fields are now covered with a pool open, but that pool is fresh and
    never written to, so every counter it reports is a zero. The same test with a
    pool that has actually absorbed and read back blocks would cover the sampler
    arithmetic, which nothing in the gate touches today.
-7. **Measure the iGPU baseline -- the one number that decides Route 1.** The
+9. **Measure the iGPU baseline -- the one number that decides Route 1.** The
    iGPU does have a working Vulkan driver (`igvk64.dll`, apiVersion 1.3.280,
    130 extensions, and it returns `VK_SUCCESS` from `vkCreateComputePipelines`),
    so the 10-40 TPS target can be measured on hardware rather than argued about
@@ -982,9 +1382,15 @@ No Vulkan SDK is required; Windows ships a loader. Always use a throwaway cache 
 cd dpu
 TMPD=$(mktemp -d)
 /a/toolchain/zig/zig.exe build check --cache-dir "$TMPD/l" --global-cache-dir "$TMPD/g" --summary all
+/a/toolchain/zig/zig.exe build gl-test --cache-dir "$TMPD/l" --global-cache-dir "$TMPD/g" --summary all
 /a/toolchain/zig/zig.exe build probe --cache-dir "$TMPD/l" --global-cache-dir "$TMPD/g" --summary all
 /a/toolchain/zig/zig.exe build bench --cache-dir "$TMPD/l" --global-cache-dir "$TMPD/g" --summary all
 ```
+
+`gl-test` is the one step that needs a **display**: it creates a real WGL
+context, which hangs rather than fails from a non-interactive session, so it is
+not in `check`. Run it on a machine with a WindowStation. Everything else in
+this list is headless.
 
 `zig build check` writes `zig-out/bin/dpu.exe`; that is deliberate, and it means
 the gate is no longer a pure verification step. To run the binary directly,
