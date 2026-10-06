@@ -62,19 +62,20 @@ is worse than no number.
 | `5232655` | #16 | Revert the wrong ABI fix, land residency on top, and stop the pool leaking disk |
 | `454d34b` | #17 | Add the missing root README, and correct the stale claims in dpu's |
 | `bc33558` | #18 | Spend the granule: a fault path that reads it, not just prices it |
-| `1890787` | #19 | Read the granule from the GPU: an OpenGL backend, and the pin that proves it fits |
+| `cd1dc8a` | #19 | Read the granule from the GPU: an OpenGL backend, and the pin that proves it fits |
 
 #14 and #15 were closed without merging; #16 replaced both, based directly on
 `main` with no stacked dependency. #17 merged at `454d34b`.
 
-**#18 and #19 are open, and #19 is stacked on #18.** #19 is the OpenGL read
-backend; it instantiates `residency.Faults` in its contract pin, and
-`residency.Faults` is what #18 introduces, so #19 targets
-`feat/granule-fault-path` rather than `main` -- that way its diff is the GL work
-alone and not #18's 865 lines. It retargets to `main` the moment #18 merges.
-Nothing about the backend's *code* depends on #18; that was measured rather than
-assumed, and the GL section below has the two worktree results that show it.
-Auto-merge is off on #19: it sits open for review.
+**#19 is merged, and #18 is open and now carries it.** #19 was the OpenGL read
+backend, opened against `feat/granule-fault-path` rather than `main` because its
+contract pin instantiates `residency.Faults`, which #18 introduces -- targeting
+`main` would have put #18's 865 lines into a PR about the GL work. It was
+**squash-merged into `feat/granule-fault-path` at `cd1dc8a`**, so the branch PR
+#18 targets `main` from already contains the backend, and #18 is what lands it on
+`main`. The stacked base was therefore resolved by merging into the stack rather
+than by retargeting, and there is nothing left to retarget: #18's head is
+`cd1dc8a`. Auto-merge was never enabled on #19.
 
 **A stacked base costs the automatic review, and this was not known until it
 happened.** The repository's automated reviewer is **CodeRabbit** (the
@@ -1110,9 +1111,10 @@ unfixed `destroyContext` it fails with `error.GlContextLost` at the surviving
 An audit of this branch (not acted on here, recorded so they are not rediscovered)
 raised these, in descending value:
 
-- The PR is stacked on `feat/granule-fault-path`, so no diff is reviewable
-  against `main` and `check` on plain `main` is red until #18 lands. Retarget
-  when it merges.
+- `check` on plain `main` is still red until #18 lands: the contract pin needs
+  `residency.Faults`, which #18 introduces. #19 has already squash-merged into
+  #18's branch at `cd1dc8a`, so #18 is now the only thing between the backend and
+  `main`.
 - Nothing routes a granule read through the backend, so the claim that one
   `glReadPixels` per granule beats the pool has no measured number.
 - `resize`, `Info`/`info()`, `valid()`, `last_error` and `pub const Error` have no
