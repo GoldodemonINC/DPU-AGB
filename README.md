@@ -120,13 +120,22 @@ atomically on every power-mode change and read once at ICD negotiation time. An
 ICD that cannot find the engine's state still has to load, but it should not
 advertise capacity nobody authorised, so it falls back to the bottom rung.
 
-Verified end to end — the published tier and the heap a real Vulkan client sees:
+Verified end to end — the published tier and the heap a real Vulkan client sees.
+Read the last column: **every row is conditional on free space**, and free space
+on `P:` moves each time the benchmark sweeps a working set through the pool.
 
-| Mode | requested | granted | `tier.cfg` | ICD heap |
-|---|---|---|---|---|
-| MAX | 24 GiB | 16 GiB (clamped) | 16 GiB | 16.00 GiB |
-| LOW | 4 GiB | 4 GiB | 4 GiB | 4.00 GiB |
-| xHIGH | 8 GiB | 8 GiB | 8 GiB | 8.00 GiB |
+| Mode | requested | granted | `tier.cfg` | ICD heap | requires free >= |
+|---|---|---|---|---|---|
+| MAX | 24 GiB | 16 GiB (clamped) | 16 GiB | 16.00 GiB | 18 GiB |
+| LOW | 4 GiB | 4 GiB | 4 GiB | 4.00 GiB | 6 GiB |
+| xHIGH | 8 GiB | 8 GiB | 8 GiB | 8.00 GiB | 10 GiB |
+
+At the **8.11 GiB** of free space on `P:` when this was last checked, the same
+three modes resolve as **MAX 6 GiB (clamped), xHIGH 6 GiB (clamped), LOW 4 GiB**.
+Two of the rows above state preconditions the volume is not currently meeting,
+which is why the free-space column is there. MAX does not *starve* here: a mode
+is an upper bound, so with 6.11 GiB of headroom it lands on the highest rung
+that fits, wherever in the ladder that happens to be.
 
 ## What a 9B model at 64k actually costs
 

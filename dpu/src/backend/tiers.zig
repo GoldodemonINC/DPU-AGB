@@ -73,11 +73,15 @@ pub const Mode = enum {
 pub const Resolution = struct {
     /// The mode's top tier, before free space was considered.
     requested: u64,
-    /// What the pool may actually use. Zero when nothing in the band fits.
+    /// What the pool may actually use: the highest rung at or below
+    /// `min(requested, budget)`. Zero only when even the ladder's first rung
+    /// does not fit. A mode is an upper bound, not a floor, so this can land
+    /// outside the mode's own band -- MAX with room for 6 GiB grants 6 GiB.
     granted: u64,
     /// True when free space cut the request below the mode's preference.
     clamped: bool,
-    /// True when no volume has room for even the mode's lowest tier.
+    /// True when `granted` is zero: not merely clamped, but nothing anywhere
+    /// on the ladder fits.
     starved: bool,
     /// Free space the grant was computed against, summed over every root, for
     /// the dashboard. This is the number that was actually available, not a
