@@ -167,9 +167,11 @@ pub const BlockDevice = struct {
     /// True when the handle really is `NO_BUFFERING | WRITE_THROUGH`. False
     /// means this pool is a cached file and its timings are cache timings.
     uncached: bool = false,
-    /// Whether `destroy` actually removed the file. False means a peer process
-    /// was still holding it, or the delete failed for any other reason, and the
-    /// pool's bytes are still on the volume. Read it with `poolRemoved`.
+    /// Whether `destroy` successfully requested the pool file's removal. See
+    /// `poolRemoved` for what true and false each mean: `true` is an accepted
+    /// unlink, which under `FILE_SHARE_DELETE` may be delete-pending until a
+    /// peer closes its handle; `false` is a refused delete, with the pool's
+    /// bytes still on the volume.
     deleted: bool = false,
     /// Handle for the cross-process pool lock, or null when it could not be
     /// created. This used to mean transfers proceeded unlocked, which is the
@@ -302,12 +304,21 @@ pub const BlockDevice = struct {
         return self.ceiling;
     }
 
-    /// Whether `destroy` removed the pool file rather than only closing it.
+    /// Whether `destroy` successfully *requested* the pool's removal.
     ///
-    /// A caller that writes gigabytes and then destroys the pool needs to know
-    /// whether the space actually came back. `destroy` cannot return an error
-    /// -- its callers are in files this module does not own -- so the outcome
-    /// is recorded and read after the fact.
+    /// Not the same as "the space is back". With `FILE_SHARE_DELETE`, the
+    /// delete can succeed while a peer still has the file open; NTFS then marks
+    /// it delete-pending and reclaims the bytes only when that last handle
+    /// closes. So `true` means the unlink was accepted, and a caller that needs
+    /// to know whether the volume has its space back yet has to ask again later
+    /// -- or close the peer.
+    ///
+    /// It does mean something concrete: `false` is a delete that was refused,
+    /// typically because a peer opened the pool *without* `FILE_SHARE_DELETE`,
+    /// in which case the pool's bytes are still on disk right now.
+    ///
+    /// `destroy` cannot return an error -- its callers are in files this module
+    /// does not own -- so the outcome is recorded and read after the fact.
     pub fn poolRemoved(self: *const BlockDevice) bool {
         return self.deleted;
     }

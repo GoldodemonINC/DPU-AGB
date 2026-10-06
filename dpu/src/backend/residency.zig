@@ -265,6 +265,10 @@ pub const Scheduler = struct {
     free_head: ?usize,
     /// Resident pages, including pinned ones.
     used: usize,
+    /// Resident pinned pages. Tracked separately because they never enter the
+    /// recency list and never become eviction candidates, so `capacity - used`
+    /// is not the room a batch actually has.
+    pinned_used: usize,
     /// Recency list, newest first. Pinned slots are deliberately *not* in it:
     /// a page that cannot be evicted has no business holding a position in an
     /// eviction order, and keeping it out makes eviction O(1) instead of a
@@ -322,6 +326,7 @@ pub const Scheduler = struct {
             .slab = try allocator.alloc(Slot, capacity),
             .free_head = null,
             .used = 0,
+            .pinned_used = 0,
             .lru_head = null,
             .lru_tail = null,
             .stats = .{},
@@ -338,7 +343,15 @@ pub const Scheduler = struct {
     /// `capacity - 1` the batch fits exactly and the demanded page survives to
     /// be read.
     pub fn effectiveReadAhead(self: *const Scheduler) u32 {
-        return @min(self.read_ahead, self.capacity - 1);
+        // Only *evictable* slots can take part of a batch. A pinned slot never
+        // leaves the set, so `capacity - 1` overstates the room when pinned
+        // pages are already resident: with capacity 4, two pinned pages loaded
+        // and read_ahead 3, a batch of four would evict the page the caller
+        // just faulted to make room for the third neighbour. One slot has to
+        // stay free for the demanded page, hence `- 1` on the evictable count.
+        const evictable = self.capacity -| self.pinned_used;
+        if (evictable == 0) return 0;
+        return @intCast(@min(self.read_ahead, evictable - 1));
     }
 
     pub fn deinit(self: *Scheduler) void {
@@ -404,7 +417,12 @@ pub const Scheduler = struct {
     /// Make a fetched page resident. Returns the allocation error rather than
     /// swallowing it: a caller that cannot be told its fetch was dropped will
     /// go on to read a page that is not in the cache.
-    pub fn load(self: *Scheduler, page: u64) std.mem.Allocator.Error!void {
+    /// A page could not be made resident. Returned rather than swallowed: a caller
+    /// that is told its fetch landed will go on to read a page the scheduler
+    /// never held.
+    pub const LoadError = std.mem.Allocator.Error || error{NoEvictableSlot};
+
+    pub fn load(self: *Scheduler, page: u64) LoadError!void {
         if (self.index.contains(page)) return;
 
         const pin = self.isPinned(page);
@@ -416,11 +434,12 @@ pub const Scheduler = struct {
             // prefix was only honoured if it happened to arrive first, which is
             // not a policy. Pinned slots are deliberately absent from the
             // recency list, so `evictOne` can never reach one; a null return
-            // means every resident page is pinned and this load is refused.
-            if (self.evictOne() == null) return;
+            // means every resident page is pinned, and dropping the page
+            // silently is exactly the bug this error exists for.
+            if (self.evictOne() == null) return error.NoEvictableSlot;
         }
 
-        const slot = self.free_head orelse return;
+        const slot = self.free_head orelse return error.NoEvictableSlot;
         self.free_head = self.slab[slot].next;
         self.slab[slot] = .{ .page = page, .prev = null, .next = null, .pinned = pin };
 
@@ -435,6 +454,7 @@ pub const Scheduler = struct {
         };
 
         self.used += 1;
+        if (pin) self.pinned_used += 1;
 
         // Pinned slots stay out of the recency list entirely.
         if (!pin) self.pushFront(slot);
@@ -473,6 +493,7 @@ pub const Scheduler = struct {
         self.slab[v] = .{ .page = 0, .prev = null, .next = self.free_head, .pinned = false };
         self.free_head = v;
         self.used -= 1;
+        // `evictOne` only ever reaches non-pinned slots, so this stays balanced.
         self.stats.evictions += 1;
         return v;
     }
@@ -793,22 +814,61 @@ test "eviction under a pinned policy never takes a pinned page" {
     try testing.expectEqual(@as(usize, 4), h.s.used);
 }
 
-test "a fully pinned set refuses to evict rather than dropping a pinned page" {
-    // Capacity and pin size equal: nothing is evictable, so a load that would
-    // need room is dropped instead of silently unpinning something. Returning
-    // without loading is the honest failure -- the alternative loses a page the
-    // caller was promised would stay.
+test "a fully pinned set refuses to evict and says so" {
+    // Capacity and pin size equal: nothing is evictable. The load must fail
+    // loudly. Returning success while the page never becomes resident is the
+    // bug this error exists for -- a caller that believes its fetch landed
+    // goes on to read a page the scheduler never held.
     var h = try Harness.init(testing.allocator, 2, .pinned, 2, 0);
     defer h.deinit();
 
     try h.s.load(0);
     try h.s.load(1);
-    try h.s.load(2);
+    try testing.expectError(error.NoEvictableSlot, h.s.load(2));
 
+    // The pinned pair is untouched, and the refused page is simply absent.
     try testing.expect(h.s.index.contains(0));
     try testing.expect(h.s.index.contains(1));
     try testing.expect(!h.s.index.contains(2));
     try testing.expectEqual(@as(u64, 0), h.s.stats.evictions);
+}
+
+test "read-ahead leaves room for the demanded page when pins are resident" {
+    // The clamp has to count *evictable* slots. Capacity 4 with two pinned
+    // pages resident leaves room for two, so a batch can be the demanded page
+    // plus one neighbour. Clamping on capacity instead would queue four and
+    // evict the page the caller just faulted.
+    var h = try Harness.init(testing.allocator, 4, .pinned, 2, 8);
+    defer h.deinit();
+
+    try h.step(0);
+    try h.step(1);
+    try testing.expectEqual(@as(usize, 2), h.s.pinned_used);
+
+    try testing.expectEqual(@as(u32, 1), h.s.effectiveReadAhead());
+
+    h.pending.clearRetainingCapacity();
+    try testing.expect(!try h.s.access(20, &h.pending));
+    try testing.expectEqual(@as(usize, 2), h.pending.items.len);
+    for (h.pending.items) |p| try h.s.load(p);
+
+    // The demanded page survived its own read-ahead.
+    try testing.expect(h.s.index.contains(20));
+    try testing.expectEqual(@as(usize, 4), h.s.used);
+}
+
+test "a fully pinned scheduler asks for no read-ahead at all" {
+    var h = try Harness.init(testing.allocator, 2, .pinned, 2, 8);
+    defer h.deinit();
+
+    try h.step(0);
+    try h.step(1);
+    try testing.expectEqual(@as(usize, 2), h.s.pinned_used);
+    try testing.expectEqual(@as(u32, 0), h.s.effectiveReadAhead());
+
+    h.pending.clearRetainingCapacity();
+    try testing.expect(!try h.s.access(50, &h.pending));
+    try testing.expectEqual(@as(usize, 1), h.pending.items.len);
 }
 
 test "a pinned page that arrives last still takes a slot" {

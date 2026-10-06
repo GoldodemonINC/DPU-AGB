@@ -511,11 +511,24 @@ pub fn main() !void {
     // last one", so the status check would be reading its own previous answer.
     const pfn_status: *const fn (c.VkDevice, c.VkFence) callconv(.c) c_int =
         @ptrCast(@alignCast(devProc("vkGetFenceStatus", device, dpu_dev) orelse return finish()));
-    const pfn_reset: *const fn (c.VkDevice, u32, ?[*]const c.VkFence) callconv(.c) void =
+    // `VkResult`, not `void`: `PFN_vkResetFences` returns one, and the probe
+    // that claims to check a reset can only do so if the status exists.
+    const pfn_reset: *const fn (c.VkDevice, u32, ?[*]const c.VkFence) callconv(.c) c_int =
         @ptrCast(@alignCast(devProc("vkResetFences", device, dpu_dev) orelse return finish()));
 
+    // The driver creates fences already signalled. Left that way, the first
+    // status read below would return VK_SUCCESS whether or not the submission
+    // ran, which is the exact failure this check exists to catch. Reset first,
+    // confirm it is unsignalled, then let the submission raise it.
+    const reset_rc = pfn_reset(device, 1, @ptrCast(&fence));
+    check(reset_rc == 0, "vkResetFences -> success ({d})", .{reset_rc});
+    const pre_status = pfn_status(device, fence);
+    check(pre_status == c.VK_NOT_READY, "fence is unsignalled before submitting ({d})", .{pre_status});
+
+    const sub2 = pfn_submit(queue, 1, &si, fence);
+    check(sub2 == 0, "vkQueueSubmit (after reset) -> success ({d})", .{sub2});
     const first_status = pfn_status(device, fence);
-    check(first_status == c.VK_SUCCESS, "fence is signalled after the first submit ({d})", .{first_status});
+    check(first_status == c.VK_SUCCESS, "fence is signalled after the submit ({d})", .{first_status});
 
     // ----------------------------------------- 6. verify against the disk
     std.debug.print("\n6. verify the bytes are on the disk\n", .{});
@@ -574,7 +587,7 @@ pub fn main() !void {
     var region: c.VkBufferCopy = .{ .srcOffset = 0, .dstOffset = 0, .size = PAYLOAD };
     pfn_copy(cmd, dev_buf, vbuf, 1, &region);
     _ = pfn_end(cmd);
-    pfn_reset(device, 1, @ptrCast(&fence));
+    check(pfn_reset(device, 1, @ptrCast(&fence)) == 0, "vkResetFences (copy back) -> success", .{});
     check(pfn_submit(queue, 1, &si, fence) == 0, "vkQueueSubmit (copy back) -> success", .{});
     _ = pfn_wait(device, 1, @ptrCast(&fence), 0, 10_000_000_000);
     const copy_back_status = pfn_status(device, fence);
@@ -602,7 +615,7 @@ pub fn main() !void {
     check(pfn_begin(cmd, &cbbi) == 0, "vkBeginCommandBuffer (fill)", .{});
     pfn_fill(cmd, dev_buf, 0, PAYLOAD, FILL);
     _ = pfn_end(cmd);
-    pfn_reset(device, 1, @ptrCast(&fence));
+    check(pfn_reset(device, 1, @ptrCast(&fence)) == 0, "vkResetFences (fill) -> success", .{});
     check(pfn_submit(queue, 1, &si, fence) == 0, "vkQueueSubmit (fill) -> success", .{});
     _ = pfn_wait(device, 1, @ptrCast(&fence), 0, 10_000_000_000);
     const fill_status = pfn_status(device, fence);
@@ -614,7 +627,7 @@ pub fn main() !void {
     check(pfn_begin(cmd, &cbbi) == 0, "vkBeginCommandBuffer (fill readback)", .{});
     pfn_copy(cmd, dev_buf, vbuf, 1, &region);
     _ = pfn_end(cmd);
-    pfn_reset(device, 1, @ptrCast(&fence));
+    check(pfn_reset(device, 1, @ptrCast(&fence)) == 0, "vkResetFences (fill readback) -> success", .{});
     check(pfn_submit(queue, 1, &si, fence) == 0, "vkQueueSubmit (fill readback) -> success", .{});
     _ = pfn_wait(device, 1, @ptrCast(&fence), 0, 10_000_000_000);
     const readback_status = pfn_status(device, fence);

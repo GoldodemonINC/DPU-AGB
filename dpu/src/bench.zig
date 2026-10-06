@@ -76,14 +76,14 @@ pub fn main() !void {
     defer {
         dev.destroy();
         if (dev.poolRemoved()) {
-            std.debug.print("\n  pool removed; the volume has its space back\n", .{});
+            std.debug.print("\n  pool unlinked; its space returns when the last handle closes\n", .{});
         } else {
             std.debug.print(
                 \\
                 \\  WARNING: the pool file could NOT be deleted -- another
                 \\  process still has it open. Its bytes are still on P:\ and the
                 \\  next run will reopen that same pool rather than a fresh one.
-                \\  Close whatever is holding P:\\DPU\\pool.vram.
+                \\  Close whatever is holding P:\DPU\pool.vram.
                 \\
             , .{});
         }
@@ -122,7 +122,17 @@ pub fn main() !void {
         // Only rows at or above the size the curve goes cold at are eligible:
         // a 64 MiB row is measuring the controller's cache, and letting it into
         // this minimum would cap every later plan at a cache rate.
-        if (mib >= DEVICE_SIZED_MIB) cold_stream_mbps = r.read_mbps;
+        if (mib >= DEVICE_SIZED_MIB) {
+            // The *minimum* of the eligible rows, not the last one. Two
+            // device-sized rows disagree by real amounts -- 412.7 MB/s at
+            // 4096 MiB against 470.8 at 8192 on the same run -- and taking the
+            // later one would let the plan promise a rate the stricter row does
+            // not reach.
+            cold_stream_mbps = if (cold_stream_mbps > 0)
+                @min(cold_stream_mbps, r.read_mbps)
+            else
+                r.read_mbps;
+        }
         std.debug.print("  {d:>5} MiB  {d:>12.1}  {d:>11.1}  {d:>11.1}  {d:>10.0}\n", .{
             mib, r.write_mbps, r.read_mbps, r.rand_read_us, r.rand_iops,
         });
@@ -382,7 +392,15 @@ fn measureGranules(dev: *blockdev.BlockDevice, cold_mbps: f64, headroom: u64) !r
     // busy volume the ceiling can be a number the pool will refuse to grow to.
     // Planning against it lets `plan` answer `streamed` for a working set whose
     // storage does not exist.
-    const usable_capacity = @min(dev.ceiling, freeSpace(dev));
+    //
+    // `held` matters as much as the free space. By the time this runs the sweep
+    // has already grown the pool to several GiB, and those bytes are already
+    // spoken for *and already on the volume* -- they are capacity the planner
+    // can use. Counting only the free space understates it by the whole pool
+    // size, which is enough on its own to turn a working set that fits into
+    // `does_not_fit`.
+    const held = dev.sparseInfo().logical;
+    const usable_capacity = @min(dev.ceiling, held +| freeSpace(dev));
 
     std.debug.print(
         \\

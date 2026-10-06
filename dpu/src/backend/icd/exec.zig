@@ -769,12 +769,24 @@ pub fn vkGetFenceStatusImpl(_: ?*anyopaque, handle: ?*anyopaque) callconv(.c) c_
     return if (f.signalled) c.VK_SUCCESS else c.VK_NOT_READY;
 }
 
-pub fn vkResetFencesImpl(_: ?*anyopaque, count: u32, p: ?[*]?*anyopaque) callconv(.c) void {
-    const list = p orelse return;
+/// `vkResetFences` returns `VkResult`.
+///
+/// It was declared `void` here, which does not match
+/// `PFN_vkResetFences`. An application calling it through the loader reads the
+/// return register for a status that was never written, so a failed reset and
+/// a successful one are indistinguishable at the call site -- and the probe
+/// that exercises it could not check the result either.
+///
+/// Per the spec, a null `pFences` or a zero `fenceCount` is
+/// `VK_ERROR_INITIALIZATION_FAILED` rather than a silent success.
+pub fn vkResetFencesImpl(_: ?*anyopaque, count: u32, p: ?[*]?*anyopaque) callconv(.c) c_int {
+    if (count == 0 or p == null) return c.VK_ERROR_INITIALIZATION_FAILED;
+    const list = p orelse return c.VK_ERROR_INITIALIZATION_FAILED;
     var i: u32 = 0;
     while (i < count) : (i += 1) {
         if (asFence(list[i])) |f| f.signalled = false;
     }
+    return c.VK_SUCCESS;
 }
 
 pub fn vkWaitForFencesImpl(

@@ -302,27 +302,61 @@ export fn vk_icdGetPhysicalDeviceProcAddr(_: ?*anyopaque, pName: ?[*:0]const u8)
     if (pName == null) return null;
     const name = std.mem.span(pName.?);
 
-    // Interface version 5 requires this to return null for anything at
-    // instance scope. It used to hand back the whole table, instance commands
-    // included, so a caller asking a physical device for `vkCreateInstance`
-    // got one. The loader is entitled to assume that cannot happen at version 5.
-    if (isInstanceScope(name)) return null;
+    // Interface version 5 requires this to return a pointer only for commands
+    // whose first dispatchable argument is a `VkPhysicalDevice`, and null for
+    // everything else -- including commands it does not recognise.
+    //
+    // An allowlist, not a denylist. The earlier version excluded six
+    // instance-scope names and let the rest of the table through, which meant
+    // a non-null answer for `vkEnumeratePhysicalDevices` (whose dispatchable
+    // argument is an instance) and for every device command such as
+    // `vkCmdWriteBuffer`. A non-null answer tells the loader it may build a
+    // physical-device trampoline, and calling a device command through that
+    // trampoline dereferences the wrong handle: it is a crash, not an error.
+    if (!isPhysicalDeviceScope(name)) return null;
 
     const entry = entryLookup(name) orelse return null;
     return @ptrCast(@constCast(entry));
 }
 
-/// Commands that belong to the instance, not to a physical device.
-fn isInstanceScope(name: []const u8) bool {
-    const instance_scope = [_][]const u8{
-        "vkGetInstanceProcAddr",
-        "vkCreateInstance",
-        "vkDestroyInstance",
-        "vkEnumerateInstanceExtensionProperties",
-        "vkEnumerateInstanceLayerProperties",
-        "vkEnumerateInstanceVersion",
+/// The commands this driver routes whose first dispatchable argument is a
+/// `VkPhysicalDevice`.
+///
+/// Everything else -- instance commands, device commands, queue commands --
+/// must come back null from `vk_icdGetPhysicalDeviceProcAddr`.
+fn isPhysicalDeviceScope(name: []const u8) bool {
+    const physical_device_scope = [_][]const u8{
+        "vkGetPhysicalDeviceProcAddr",
+        "vkGetPhysicalDeviceProperties",
+        "vkGetPhysicalDeviceProperties2",
+        "vkGetPhysicalDeviceProperties2KHR",
+        "vkGetPhysicalDeviceFeatures",
+        "vkGetPhysicalDeviceFeatures2",
+        "vkGetPhysicalDeviceFeatures2KHR",
+        "vkGetPhysicalDeviceMemoryProperties",
+        "vkGetPhysicalDeviceMemoryProperties2",
+        "vkGetPhysicalDeviceMemoryProperties2KHR",
+        "vkEnumerateDeviceExtensionProperties",
+        "vkEnumerateDeviceLayerProperties",
+        "vkEnumerateDeviceQueueFamilies",
+        "vkGetPhysicalDeviceQueueFamilyProperties",
+        "vkGetPhysicalDeviceFormatProperties",
+        "vkGetPhysicalDeviceImageFormatProperties",
+        "vkGetPhysicalDeviceImageFormatProperties2",
+        "vkGetPhysicalDeviceSparseImageFormatProperties",
+        "vkGetPhysicalDeviceSparseImageFormatProperties2",
+        "vkGetPhysicalDeviceExternalBufferProperties",
+        "vkGetPhysicalDeviceExternalFenceProperties",
+        "vkGetPhysicalDeviceExternalSemaphoreProperties",
+        "vkGetPhysicalDeviceToolProperties",
+        "vkGetPhysicalDeviceSurfaceSupportKHR",
+        "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+        "vkGetPhysicalDeviceSurfaceFormatsKHR",
+        "vkGetPhysicalDeviceSurfacePresentModesKHR",
+        "vkEnumeratePhysicalDeviceGroups",
+        "vkEnumeratePhysicalDeviceGroupsKHR",
     };
-    for (instance_scope) |s| {
+    for (physical_device_scope) |s| {
         if (std.mem.eql(u8, name, s)) return true;
     }
     return false;

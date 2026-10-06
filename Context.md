@@ -549,9 +549,14 @@ loader and the same battery produce three `VK_SUCCESS` on a real compute-capable
 ICD, so the refusals belong to the DPU rather than to the harness.
 
 Two related defects fall out of the same run. `vk_icd.json` declares
-`"api_version":"1.3"` but the ICD does not implement
-`vkEnumerateInstanceVersion`, so the loader logs `treating as a 1.0 ICD`; the
-device property still reports 1.3.0 because DPU fills it in directly. And the
+`"api_version":"1.3"` and the ICD did not implement `vkEnumerateInstanceVersion`,
+so the loader could not confirm the claim and logged `treating as a 1.0 ICD`.
+**Both halves are now fixed:** the entry point reports 1.3, and the honest
+consequence -- Vulkan 1.3 needs loader interface version 5 -- moved
+`ICD_INTERFACE_VERSION` from 4 to 5, with
+`vk_icdGetPhysicalDeviceProcAddr` restricted to the commands whose first
+dispatchable argument is a `VkPhysicalDevice`. With both in place the loader
+logs no ICD warnings at all. And the
 loader finds the iGPU's ICD in the DriverStore
 (`...\iigd_dch.inf_amd64_...\igvk64.json`) by enumerating display devices, not
 through `HKLM\SOFTWARE\Khronos\Vulkan\Drivers`, which is empty -- so the
@@ -721,9 +726,9 @@ token, and at 64k the cache is 55% of the working set before quantisation is
 even considered. Quantising the *cache* is the lever, not the weights, and it is
 a model-side decision that no amount of DPU policy can make.
 - **6 tok/s requires the working set resident, not paged.** At a 427 MB/s device
-the budget is ~330 MB of misses per token, against a 5.6 GB f16 cache for the 3B
-alone. Only the `RESIDENT` row reaches that regime, and it does so without the
-pool: the third row of the table is what "fits" looks like.
+the budget is ~330 MB of misses per token, against a **7.5 GB** f16 cache for the
+3B alone. Only the `RESIDENT` row reaches that regime, and it does so without the
+pool: the **first** row of the table is what "fits" looks like.
 
 ### The mechanism that does ship
 
@@ -863,14 +868,21 @@ and the benchmark prints `pool removed; the volume has its space back`. That is
 the exact operation that used to lose gigabytes silently, and the warning path
 is there for the case where a peer still holds the pool open.
 
-**One consequence worth knowing:** the planner is now handed *usable* capacity
-(`min(ceiling, free - reserve)`) rather than the configured ceiling, so the 9B
-rows above no longer read `STREAMED` unconditionally. In the run above, with
-6 GB of headroom, **9B q4/q4 reported `DOES NOT FIT`** where it previously
-reported 0.117 tok/s against the 8 GiB ceiling. That is the fix working: the
-verdict now follows the storage the block device will actually agree to grow
-into, so the same scenario flips with the volume's free space. The `tok/s`
-figures in the table were taken on a run with the room to grant it.
+**On capacity, and a mistake I made in it.** The planner is handed the capacity
+the block device will actually agree to grow into rather than the configured
+ceiling: `min(ceiling, pool_bytes_already_held + free - reserve)`. The first
+version of that expression left out `pool_bytes_already_held`, and the
+consequence was immediate and wrong: by the time the benchmark plans, its own
+sweep has grown the pool to several GiB, and counting only the *free* space
+understated the capacity by that whole amount. On the run recorded above,
+**9B q4/q4 printed `DOES NOT FIT`** for a working set of 10.3 GB that the pool
+was in fact carrying. I wrote that paragraph up as the fix working. It was the
+miscount.
+
+The `held` term is what makes it honest: those bytes are already spent *and*
+already on the volume, which is precisely what capacity means. A verdict here is
+now sensitive to real free space rather than to an artefact of when the plan ran,
+which is the property that was wanted from the start.
 
 ## What comes next
 
@@ -899,8 +911,8 @@ cases behave:
 
 | environment | result |
 | --- | --- |
-| DPU only, `VK_DRIVER_FILES=./vk_icd.json` | 51/51, exit 0 |
-| ambient iGPU + DPU, `zig build probe` | 51/51, exit 0 |
+| DPU only, `VK_DRIVER_FILES=./vk_icd.json` | 61/61, exit 0 |
+| ambient iGPU + DPU, `zig build probe` | 61/61, exit 0 |
 | DPU absent (no `VK_*` set) | exit 1, `the DPU is present` |
 | no ICDs at all | exit 3, `vkCreateInstance -> VK_ERROR_INCOMPATIBLE_DRIVER` |
 
@@ -909,9 +921,9 @@ run failed on the device *count*, which named the wrong problem; it now fails
 on the check that states the real one -- the DPU was not found -- so relaxing
 the count could not quietly turn the probe into a no-op.
 
-One item from that list is still open: add `vkEnumerateInstanceVersion` so
-`vk_icd.json` can honestly declare 1.3. Without it the loader logs `treating as
-a 1.0 ICD`, because the manifest's declared API version is never confirmed.
+That list is now closed: `vkEnumerateInstanceVersion` is implemented, the loader
+confirms the manifest's 1.3, and the interface version moved to 5 to match. See
+the section on the loader/ICD handle contract above.
 
 0. **Wire the residency scheduler to a real fault path.** It exists, it is
    tested, and nothing calls it yet -- `prefetchDepth` is now a page count for
