@@ -501,6 +501,303 @@ pub const Scheduler = struct {
     pub fn hitRate(self: *const Scheduler) f64 {
         return self.stats.hitRate();
     }
+
+    /// Which slot holds `page`, or null when it is not resident.
+    ///
+    /// A fault path owns the *bytes* and needs the slot they live in.
+    /// `access` and `load` deliberately answer only "is it resident", because
+    /// that is the question the policy is about and the storage layout is not
+    /// the scheduler's to know. This accessor is the seam: the scheduler stays
+    /// a set of decisions, and whatever holds the pages reads the mapping here.
+    ///
+    /// The returned slot is only valid until the next `load` that evicts. It is
+    /// an index into a slab that is reused constantly, so holding one across a
+    /// fetch is how a fault path ends up copying from the wrong granule.
+    pub fn slotOf(self: *const Scheduler, page: u64) ?usize {
+        return self.index.get(page);
+    }
+};
+
+/// The granule fault path: a scheduler-backed cache that reads a whole
+/// granule on a miss and serves the rest of it from RAM.
+///
+/// The benchmark is the reason this exists. One uncached 4 KiB read costs
+/// 36.5 us on this machine, so a client walking a working set in 4 KiB steps
+/// moves 106.8 MB/s however fast the volume is; the same bytes in 1 MiB reads
+/// move 580.5 MB/s. The fault *size* is the lever -- 5.4x, measured, with no
+/// other variable changed. Until now that number existed only as a row in the
+/// benchmark table and as `plan`'s third argument, so it was priced and never
+/// spent: nothing in the read path took one.
+///
+/// `Backend` is a type offering
+///
+///     pub fn read(self: *Backend, offset: u64, buf: []u8) anyerror!usize
+///
+/// which is `blockdev.BlockDevice`'s own shape. Taking it as a comptime
+/// parameter rather than a stored pointer keeps the error set inferred from the
+/// backend instead of erased to `anyerror`, and keeps this file importing
+/// nothing from the backend -- the property that lets `residency` still be
+/// tested as arithmetic rather than against a device.
+///
+/// Every fault path obeys three rules, and each of them was a bug first:
+///
+/// 1. **A request at least as large as the granule is not cached.** The caller
+///    is already asking for fault-sized I/O; buffering it would allocate and
+///    fill a slab the caller immediately overwrites, and would report a miss
+///    rate made of reads that were never inefficient.
+/// 2. **A short fetch is remembered as a short granule, not padded.** The tail
+///    past the end of the working set is zeroed so no caller can read
+///    uninitialised memory, and a later read in that same granule is still a
+///    *hit* -- the bytes really are resident, they just stop short.
+/// 3. **The demanded granule is served before read-ahead is fetched.** Read
+///    ahead is an optimisation and must never be the reason a call fails; if
+///    the extra fetch errors, the demand still succeeds.
+pub fn Faults(comptime Backend: type) type {
+    return struct {
+        const Self = @This();
+
+        /// Alignment of the resident slab. `blockdev` refuses a transfer whose
+        /// buffer is not `SECTOR`-aligned, so the slab is aligned to the same
+        /// boundary and every granule inside it inherits that alignment.
+        const SLAB_ALIGN: u64 = PAGE;
+
+        /// Everything `read` can return: the backend's error set, this
+        /// allocator's, the scheduler's `LoadError`, and two of this module's
+        /// own -- `InvalidGranule` (from `init`: zero, unaligned, or below
+        /// `PAGE`) and `PageNotResident` (the scheduler said a granule was
+        /// resident and then had no slot for it, which `read` cannot provoke
+        /// and names anyway so that it is visible if it ever happens).
+        ///
+        /// It is `anyerror` rather than the union spelled out, because the
+        /// backend's set is whatever `Backend.read` returns and only a comptime
+        /// instantiation knows it. The two errors above are still returned by
+        /// name, so a caller matching on them does not care how the union
+        /// types.
+        pub const Error = anyerror;
+
+        pub const Config = struct {
+            /// Fault size in bytes: a power of two, at least `PAGE`. Defaults
+            /// to the page, which is the *worst* choice the module allows and
+            /// is left there deliberately -- a caller that has not measured a
+            /// granule should get the honest floor, not a flattering default
+            /// that quietly makes a slow path look fast.
+            granule: u64 = PAGE,
+            /// Bytes of working set kept resident. Rounded down to whole
+            /// granules; defaults to 64 of them.
+            capacity_bytes: u64 = 0,
+            /// Granules fetched beyond each miss.
+            read_ahead: u32 = 0,
+            /// Granules in the working set, or 0 when it is not known. Read
+            /// ahead past the end of a finite backing store asks the backend
+            /// for bytes that do not exist, so a client that knows its extent
+            /// passes it here.
+            granules: u64 = 0,
+            policy: Policy = .pinned,
+            /// Leading granules held permanently under `Policy.pinned`.
+            pinned_granules: u64 = 0,
+        };
+
+        allocator: std.mem.Allocator,
+        backend: *Backend,
+        granule: u64,
+        /// Granule -> slot index. Parallel to `Scheduler`'s own map, and
+        /// invalidated by the same evictions.
+        sched: Scheduler,
+        /// The backing allocation, held to free. The aligned view below is a
+        /// window inside it, so freeing needs the original slice.
+        raw: []u8,
+        /// `capacity * granule` bytes, aligned to `SLAB_ALIGN`.
+        slab: []u8,
+        /// Bytes actually fetched into each slot. Less than `granule` for the
+        /// final granule of a finite working set.
+        valid: []usize,
+        /// Read-ahead fetches that did not land. Counted, never fatal.
+        skipped: u64 = 0,
+
+        pub fn init(
+            allocator: std.mem.Allocator,
+            backend: *Backend,
+            config: Config,
+        ) Error!Self {
+            if (config.granule < PAGE or !std.math.isPowerOfTwo(config.granule)) {
+                return error.InvalidGranule;
+            }
+
+            const granule = config.granule;
+            const capacity_bytes = if (config.capacity_bytes == 0)
+                granule * 64
+            else
+                config.capacity_bytes;
+            // Rounded *down* to whole granules. Rounding up would silently
+            // allocate more than the caller asked to keep resident, which is
+            // the opposite error and the more expensive one.
+            const slots = @max(@as(usize, 1), @as(usize, @intCast(capacity_bytes / granule)));
+
+            // Over-allocate by one slab alignment and align by hand, because a
+            // `[]u8` cannot carry an alignment and `blockdev` refuses a
+            // transfer whose buffer is not sector-aligned. Every granule is a
+            // multiple of `PAGE`, so aligning the base aligns all of them.
+            const span = slots * @as(usize, @intCast(granule));
+            const raw = try allocator.alloc(u8, span + SLAB_ALIGN);
+            errdefer allocator.free(raw);
+            const base = std.mem.alignForward(
+                usize,
+                @intFromPtr(raw.ptr),
+                SLAB_ALIGN,
+            );
+            const slab = raw[base - @intFromPtr(raw.ptr) ..][0..span];
+
+            const valid = try allocator.alloc(usize, slots);
+            errdefer allocator.free(valid);
+            @memset(valid, 0);
+
+            const sched = Scheduler.init(
+                allocator,
+                slots,
+                config.policy,
+                config.pinned_granules,
+                config.read_ahead,
+                config.granules,
+            ) catch |e| return e;
+            errdefer sched.deinit();
+
+            return .{
+                .allocator = allocator,
+                .backend = backend,
+                .granule = granule,
+                .sched = sched,
+                .raw = raw,
+                .slab = slab,
+                .valid = valid,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.sched.deinit();
+            self.allocator.free(self.valid);
+            self.allocator.free(self.raw);
+        }
+
+        fn bytes(self: *Self, slot: usize) []u8 {
+            const g: usize = @intCast(self.granule);
+            return self.slab[slot * g ..][0..g];
+        }
+
+        /// Read `buf.len` bytes at `offset`, faulting whole granules.
+        ///
+        /// Returns the caller's byte count. A short return means the working
+        /// set ends inside the request, and the bytes up to it are real.
+        pub fn read(self: *Self, offset: u64, buf: []u8) Error!usize {
+            if (buf.len == 0) return 0;
+            if (buf.len >= self.granule) return self.backend.read(offset, buf);
+
+            const page = offset / self.granule;
+            const within: usize = @intCast(offset % self.granule);
+
+            // `access` is called on every read, hit included: it is what counts
+            // the hit. On a hit it returns before appending anything, so the
+            // list below allocates nothing and the common path costs no
+            // allocator traffic at all.
+            var pending: std.ArrayList(u64) = .empty;
+            defer pending.deinit(self.allocator);
+            _ = try self.sched.access(page, &pending);
+
+            if (pending.items.len > 0) {
+                // The demanded granule first, and its read-ahead after. If the
+                // speculative fetch fails the demand still succeeds -- the
+                // extra reads are an optimisation, and an optimisation that can
+                // fail a read is not one.
+                try self.fetchInto(pending.items[0]);
+                var i: usize = 1;
+                while (i < pending.items.len) : (i += 1) {
+                    // Counted, not dropped, and not printed. A prefetch that
+                    // never lands is the difference between a hit and a miss on
+                    // the next pass, so `stats().skipped` is where it shows up.
+                    // Printing from a policy module would be the wrong place
+                    // for it: this is a library that is called from the ICD,
+                    // from the engine and from tests, and stderr from the
+                    // middle of a client's read is noise nobody can act on.
+                    self.fetchInto(pending.items[i]) catch {
+                        self.skipped += 1;
+                    };
+                }
+            }
+
+            const slot = self.sched.slotOf(page) orelse return error.PageNotResident;
+            const start = @min(within, self.valid[slot]);
+            const n = @min(buf.len, self.valid[slot] - start);
+            @memcpy(buf[0..n], self.bytes(slot)[start..][0..n]);
+            return n;
+        }
+
+        /// Make one granule resident, fetching it if the set had to evict for
+        /// it.
+        fn fetchInto(self: *Self, page: u64) Error!void {
+            if (self.sched.slotOf(page) != null) return;
+            try self.sched.load(page);
+            const slot = self.sched.slotOf(page) orelse return error.PageNotResident;
+
+            // `page * granule` cannot overflow for any page the scheduler can
+            // hold: the index came from `offset / granule`, and a backend that
+            // reported a working set that large would have failed to allocate
+            // the slab long before this.
+            const base = page *% self.granule;
+            const buf = self.bytes(slot);
+            const got = try self.backend.read(base, buf);
+            // A backend that reports more than it was given has a bug that
+            // would otherwise turn into a silent overflow of the slab on the
+            // next fetch.
+            const valid = @min(got, buf.len);
+            if (valid < buf.len) @memset(buf[valid..], 0);
+            self.valid[slot] = valid;
+        }
+
+        pub fn setReadAhead(self: *Self, n: u32) void {
+            self.sched.read_ahead = n;
+        }
+
+        /// Granule -> slot mapping for the current resident set. Exposed so a
+        /// caller can assert on residency without reaching through the
+        /// scheduler, and so the tests can check that a granule really was
+        /// evicted rather than merely counted as evicted.
+        pub fn isResident(self: *const Self, granule_index: u64) bool {
+            return self.sched.slotOf(granule_index) != null;
+        }
+
+        pub fn stats(self: *const Self) FaultStats {
+            return .{
+                .hits = self.sched.stats.hits,
+                .misses = self.sched.stats.misses,
+                .evictions = self.sched.stats.evictions,
+                .prefetched = self.sched.stats.prefetched,
+                .skipped = self.skipped,
+            };
+        }
+
+        /// Effective read-ahead after the scheduler's clamps, so a caller
+        /// setting a depth sees what it will actually get rather than what it
+        /// asked for.
+        pub fn effectiveReadAhead(self: *const Self) u32 {
+            return self.sched.effectiveReadAhead();
+        }
+    };
+}
+
+/// What a fault path has done, for the dashboard and the tests.
+pub const FaultStats = struct {
+    hits: u64 = 0,
+    misses: u64 = 0,
+    evictions: u64 = 0,
+    /// Granules fetched without being asked for.
+    prefetched: u64 = 0,
+    /// Read-ahead fetches that did not land. Non-fatal by construction.
+    skipped: u64 = 0,
+
+    pub fn hitRate(self: FaultStats) f64 {
+        const total = self.hits + self.misses;
+        if (total == 0) return 1.0;
+        return @as(f64, @floatFromInt(self.hits)) / @as(f64, @floatFromInt(total));
+    }
 };
 
 // --------------------------------------------------------------- tests
@@ -981,4 +1278,344 @@ test "hitRate is one before any access rather than zero" {
     // as one would make an unused scheduler look broken on the dashboard.
     const s = Scheduler.Stats{};
     try testing.expectEqual(@as(f64, 1.0), s.hitRate());
+}
+
+// ------------------------------------------------------- the fault path
+
+/// An in-memory backend for the fault-path tests, counting the reads it is
+/// asked for. The point of the granule is visible in exactly one number, and
+/// this is where it shows up: `reads` is the round-trip count.
+const FakeBackend = struct {
+    bytes: []u8,
+    /// Reads issued.
+    reads: usize = 0,
+    /// Bytes the backend was asked to produce.
+    requested: usize = 0,
+    /// Length of the last read, so a test can prove the fault size.
+    last_len: usize = 0,
+    /// Fail from this read onwards, so a test can prove read-ahead cannot fail
+    /// a demand.
+    fail_from: usize = std.math.maxInt(usize),
+
+    pub fn read(self: *FakeBackend, offset: u64, buf: []u8) anyerror!usize {
+        if (self.reads >= self.fail_from) return error.ReadFailed;
+        self.reads += 1;
+        self.requested += buf.len;
+        self.last_len = buf.len;
+        if (offset >= self.bytes.len) return 0;
+        const n = @min(buf.len, self.bytes.len - offset);
+        @memcpy(buf[0..n], self.bytes[@intCast(offset)..][0..n]);
+        return n;
+    }
+};
+
+/// A backend whose every byte is its own index, so a mis-sliced copy shows up
+/// as wrong data rather than as a plausible number.
+fn ramp(n: usize) std.mem.Allocator.Error![]u8 {
+    const out = try testing.allocator.alloc(u8, n);
+    for (out, 0..) |*b, i| b.* = @truncate(i);
+    return out;
+}
+
+test "a 4 KiB read faults a whole granule, and the bytes are right" {
+    const backing = try ramp(4 * 1024 * 1024);
+    defer testing.allocator.free(backing);
+    var be = FakeBackend{ .bytes = backing };
+
+    const F = Faults(FakeBackend);
+    var f = try F.init(testing.allocator, &be, .{
+        .granule = 64 * 1024,
+        .capacity_bytes = 256 * 1024,
+    });
+    defer f.deinit();
+
+    var buf: [4096]u8 = undefined;
+    const n = try f.read(0, &buf);
+
+    try testing.expectEqual(@as(usize, 4096), n);
+    // The whole point: 4 KiB asked for, 64 KiB fetched. One round trip rather
+    // than one per 4 KiB the caller wanted.
+    try testing.expectEqual(@as(usize, 1), be.reads);
+    try testing.expectEqual(@as(usize, 64 * 1024), be.last_len);
+    for (buf, 0..) |b, i| try testing.expectEqual(@as(u8, @truncate(i)), b);
+}
+
+test "a second read inside the same granule costs nothing" {
+    const backing = try ramp(4 * 1024 * 1024);
+    defer testing.allocator.free(backing);
+    var be = FakeBackend{ .bytes = backing };
+
+    const F = Faults(FakeBackend);
+    var f = try F.init(testing.allocator, &be, .{
+        .granule = 64 * 1024,
+        .capacity_bytes = 256 * 1024,
+    });
+    defer f.deinit();
+
+    var buf: [4096]u8 = undefined;
+    _ = try f.read(0, &buf);
+    _ = try f.read(8192, &buf);
+    _ = try f.read(60 * 1024, &buf);
+
+    try testing.expectEqual(@as(usize, 1), be.reads);
+    const s = f.stats();
+    try testing.expectEqual(@as(u64, 1), s.misses);
+    try testing.expectEqual(@as(u64, 2), s.hits);
+    try testing.expectEqual(@as(f64, 2.0 / 3.0), s.hitRate());
+}
+
+test "a request at least as large as the granule is not cached" {
+    // It is already fault-sized. Caching it would allocate a slab the caller
+    // immediately overwrites, and would report misses for reads that were
+    // never inefficient.
+    const backing = try ramp(4 * 1024 * 1024);
+    defer testing.allocator.free(backing);
+    var be = FakeBackend{ .bytes = backing };
+
+    const F = Faults(FakeBackend);
+    var f = try F.init(testing.allocator, &be, .{
+        .granule = 64 * 1024,
+        .capacity_bytes = 256 * 1024,
+    });
+    defer f.deinit();
+
+    var buf: [64 * 1024]u8 = undefined;
+    const n = try f.read(0, &buf);
+
+    try testing.expectEqual(@as(usize, 64 * 1024), n);
+    try testing.expectEqual(@as(usize, 1), be.reads);
+    try testing.expectEqual(@as(usize, 64 * 1024), be.last_len);
+    try testing.expect(!f.isResident(0));
+    try testing.expectEqual(@as(u64, 0), f.stats().misses);
+}
+
+test "a read past the end of the working set stops short and is still a hit" {
+    // 100 KiB of working set in 64 KiB granules: the second granule is short.
+    const backing = try ramp(100 * 1024);
+    defer testing.allocator.free(backing);
+    var be = FakeBackend{ .bytes = backing };
+
+    const F = Faults(FakeBackend);
+    var f = try F.init(testing.allocator, &be, .{
+        .granule = 64 * 1024,
+        .capacity_bytes = 256 * 1024,
+    });
+    defer f.deinit();
+
+    var buf: [4096]u8 = undefined;
+
+    // 90 KiB is inside the working set and inside the short granule.
+    const inside = try f.read(90 * 1024, &buf);
+    try testing.expectEqual(@as(usize, 4096), inside);
+    for (buf, 0..) |b, i| try testing.expectEqual(@as(u8, @truncate(90 * 1024 + i)), b);
+
+    // Exactly at the end: zero bytes, and no second fetch. The granule really
+    // is resident -- it is short, not absent.
+    const at_end = try f.read(100 * 1024, &buf);
+    try testing.expectEqual(@as(usize, 0), at_end);
+    try testing.expectEqual(@as(usize, 1), be.reads);
+    try testing.expectEqual(@as(u64, 1), f.stats().hits);
+}
+
+test "the short tail of a granule is never handed back" {
+    // The final granule of a finite working set is short. `valid` is what gates
+    // the copy, so the bytes past the end are unreachable -- and the fetch
+    // zeroes them anyway, so a future change that widens `valid` cannot start
+    // returning whatever the allocator had in the slab.
+    const backing = try ramp(64 * 1024 + 10);
+    defer testing.allocator.free(backing);
+    var be = FakeBackend{ .bytes = backing };
+
+    const F = Faults(FakeBackend);
+    var f = try F.init(testing.allocator, &be, .{
+        .granule = 64 * 1024,
+        .capacity_bytes = 4 * 64 * 1024,
+    });
+    defer f.deinit();
+
+    var buf: [4096]u8 = undefined;
+    @memset(&buf, 0xFF);
+
+    // The last 10 bytes of the working set. The request starts 6 bytes into
+    // the granule and the granule is 10 bytes long, so 4 come back -- not 10.
+    try testing.expectEqual(@as(usize, 4), try f.read(64 * 1024 + 6, &buf));
+    for (buf[0..4], 0..) |b, i| try testing.expectEqual(@as(u8, @truncate(64 * 1024 + 6 + i)), b);
+
+    // One byte past the end: nothing, and still no fetch.
+    const past = try f.read(64 * 1024 + 10, &buf);
+    try testing.expectEqual(@as(usize, 0), past);
+    try testing.expectEqual(@as(usize, 1), be.reads);
+}
+
+test "a granule below a sector, or not a power of two, is refused" {
+    const backing = try ramp(4096);
+    defer testing.allocator.free(backing);
+    var be = FakeBackend{ .bytes = backing };
+
+    const F = Faults(FakeBackend);
+    // 0 would divide by zero in the page arithmetic; 5000 is not a power of
+    // two, so `offset / granule` is not a shift and `offset % granule` is not a
+    // mask; 2048 is a power of two but under `PAGE`, which would break the
+    // slab's alignment for every granule after the first.
+    try testing.expectError(error.InvalidGranule, F.init(testing.allocator, &be, .{ .granule = 0 }));
+    try testing.expectError(error.InvalidGranule, F.init(testing.allocator, &be, .{ .granule = 5000 }));
+    try testing.expectError(error.InvalidGranule, F.init(testing.allocator, &be, .{ .granule = 2048 }));
+}
+
+test "read-ahead fetches the neighbours, and they are then hits" {
+    const backing = try ramp(4 * 1024 * 1024);
+    defer testing.allocator.free(backing);
+    var be = FakeBackend{ .bytes = backing };
+
+    const F = Faults(FakeBackend);
+    var f = try F.init(testing.allocator, &be, .{
+        .granule = 64 * 1024,
+        .capacity_bytes = 4 * 64 * 1024,
+        .read_ahead = 2,
+    });
+    defer f.deinit();
+
+    var buf: [4096]u8 = undefined;
+    _ = try f.read(0, &buf);
+
+    // One demand, two neighbours, three fetches.
+    try testing.expectEqual(@as(usize, 3), be.reads);
+    try testing.expect(f.isResident(0));
+    try testing.expect(f.isResident(1));
+    try testing.expect(f.isResident(2));
+    try testing.expectEqual(@as(u64, 2), f.stats().prefetched);
+
+    // The prefetched granules hold the right bytes, not just the right count.
+    var check: [4096]u8 = undefined;
+    _ = try f.read(64 * 1024, &check);
+    for (check, 0..) |b, i| try testing.expectEqual(@as(u8, @truncate(64 * 1024 + i)), b);
+}
+
+test "read-ahead past a known extent is not fetched" {
+    // Asking the backend for granules that do not exist wastes a round trip at
+    // the end of every sequential walk. A client that knows its extent says so,
+    // and the walk stops at it.
+    const backing = try ramp(4 * 1024 * 1024);
+    defer testing.allocator.free(backing);
+    var be = FakeBackend{ .bytes = backing };
+
+    const F = Faults(FakeBackend);
+    var f = try F.init(testing.allocator, &be, .{
+        .granule = 64 * 1024,
+        .capacity_bytes = 4 * 64 * 1024,
+        .read_ahead = 8,
+        .granules = 4,
+    });
+    defer f.deinit();
+
+    var buf: [4096]u8 = undefined;
+    _ = try f.read(0, &buf);
+
+    // Granules 0..4 exist, so the demand plus three read-ahead, nothing more.
+    try testing.expectEqual(@as(usize, 4), be.reads);
+    try testing.expect(!f.isResident(4));
+    try testing.expectEqual(@as(u64, 3), f.stats().prefetched);
+}
+
+test "the fault path evicts by the scheduler's policy" {
+    const backing = try ramp(4 * 1024 * 1024);
+    defer testing.allocator.free(backing);
+    var be = FakeBackend{ .bytes = backing };
+
+    const F = Faults(FakeBackend);
+    var f = try F.init(testing.allocator, &be, .{
+        .granule = 64 * 1024,
+        .capacity_bytes = 2 * 64 * 1024,
+    });
+    defer f.deinit();
+
+    var buf: [4096]u8 = undefined;
+    _ = try f.read(0, &buf);
+    _ = try f.read(64 * 1024, &buf);
+    _ = try f.read(128 * 1024, &buf);
+
+    // Three granules through a two-granule set: the first is gone, and it is
+    // gone rather than merely counted -- `isResident` is the map, not the
+    // counter.
+    try testing.expect(!f.isResident(0));
+    try testing.expect(f.isResident(1));
+    try testing.expect(f.isResident(2));
+    try testing.expectEqual(@as(u64, 1), f.stats().evictions);
+
+    // And a re-read of the evicted granule faults again.
+    const before = be.reads;
+    _ = try f.read(0, &buf);
+    try testing.expectEqual(before + 1, be.reads);
+}
+
+test "a failed read-ahead does not fail the demanded read" {
+    const backing = try ramp(4 * 1024 * 1024);
+    defer testing.allocator.free(backing);
+    // The demand is read 0; every read-ahead after it fails.
+    var be = FakeBackend{ .bytes = backing, .fail_from = 1 };
+
+    const F = Faults(FakeBackend);
+    var f = try F.init(testing.allocator, &be, .{
+        .granule = 64 * 1024,
+        .capacity_bytes = 4 * 64 * 1024,
+        .read_ahead = 4,
+    });
+    defer f.deinit();
+
+    var buf: [4096]u8 = undefined;
+    const n = try f.read(0, &buf);
+
+    try testing.expectEqual(@as(usize, 4096), n);
+    try testing.expect(f.isResident(0));
+
+    // A four-slot set asked for four granules of read-ahead grants three, not
+    // four: the demanded granule takes a slot of its own, and a batch that
+    // filled the set would evict the very page the caller is about to read.
+    // This is the scheduler's clamp, reached through the fault path's config.
+    try testing.expectEqual(@as(u32, 3), f.effectiveReadAhead());
+    // All three failed, and none of them took the demand down with it.
+    try testing.expectEqual(@as(u64, 3), f.stats().skipped);
+    try testing.expectEqual(@as(usize, 1), be.reads);
+}
+
+test "the granule is the lever: same bytes, one sixteenth the round trips" {
+    // This is the measured claim reduced to arithmetic. The benchmark measured
+    // 106.8 MB/s at a 4 KiB fault against 580.5 MB/s at 1 MiB on this machine,
+    // 5.4x, with nothing else changed. Here the whole lever is two counters:
+    // the same 256 KiB walk, the same bytes off the backend, and the round-trip
+    // count falls by exactly the ratio of the granules.
+    const walk: usize = 256 * 1024;
+    const step: usize = 4096;
+
+    const backing = try ramp(walk);
+    defer testing.allocator.free(backing);
+
+    var small_be = FakeBackend{ .bytes = backing };
+    const Small = Faults(FakeBackend);
+    var small = try Small.init(testing.allocator, &small_be, .{
+        .granule = 4096,
+        .capacity_bytes = walk,
+    });
+    defer small.deinit();
+
+    var big_be = FakeBackend{ .bytes = backing };
+    const Big = Faults(FakeBackend);
+    var big = try Big.init(testing.allocator, &big_be, .{
+        .granule = 64 * 1024,
+        .capacity_bytes = walk,
+    });
+    defer big.deinit();
+
+    var buf: [step]u8 = undefined;
+    var off: usize = 0;
+    while (off < walk) : (off += step) {
+        _ = try small.read(off, &buf);
+        _ = try big.read(off, &buf);
+    }
+
+    // 64 faults at 4 KiB, 4 at 64 KiB, and the same 256 KiB either way.
+    try testing.expectEqual(@as(usize, 64), small_be.reads);
+    try testing.expectEqual(@as(usize, 4), big_be.reads);
+    try testing.expectEqual(small_be.requested, big_be.requested);
+    try testing.expectEqual(walk, big_be.requested);
 }

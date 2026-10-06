@@ -5,14 +5,27 @@ applications as a discrete GPU through a user-mode installable client driver.
 
 ## Status at this commit
 
-`zig build check` — **140/140 tests**, exit 0, `zig fmt --check` clean. The gate
-also builds `dpu.exe` and `dpubench`, so a green run means both shipped
-binaries compile.
+`zig build check` — **151/151 tests** (17/17 steps), exit 0, `zig fmt --check`
+clean. The gate also builds `dpu.exe` and `dpubench`, so a green run means both
+shipped binaries compile. The eleven new tests are the granule fault path's.
 
 `zig build probe` — **61/61, exit 0**, closing with
 `PROBE_SUMMARY: total=61 passed=61 failed=0 result=PASS` and
 `RESULT: PASS -- the DPU heap carries real bytes on disk`, and with **no loader
 warnings at all** under `VK_LOADER_DEBUG=error,warn`.
+
+`zig build bench` — **fails on this machine, and not because of this branch.**
+It aborts with `PoolOutOfSpace` at the 4096 MiB sweep row with 6.26 GiB free on
+`P:`. This was measured rather than assumed: `origin/main` in a clean worktree
+fails at the same row, with the same error and the same exit 1, and the two logs
+are identical on every volume and error line. It is a real latent bug in the
+sweep — the headroom budget is taken once, before the first row, so by the last
+row it is stale by every byte the earlier rows committed, and a row can pass the
+bench's check and then lose the whole run inside `ensureRoom`, which is the
+opposite of the "drop the row and carry on" the code around it promises. Left
+unfixed here on purpose: the sweep is not what this change is about, and
+quietly skipping rows to make a benchmark green is how a benchmark stops
+meaning anything.
 
 Every number here was measured on this machine for this tree. An earlier copy of
 this file claimed the probe was 45/45; that was stale, and a number nobody re-ran
@@ -751,6 +764,10 @@ referred to as "the residency scheduler" since before it existed. It is policy
 and arithmetic only: it imports nothing from the backend, holds no handles, and
 is tested as arithmetic rather than against a device.
 
+That last sentence used to be the whole story, and it was the wrong story: a
+module that decides *what* to keep resident, with nothing that ever asks it,
+is arithmetic. The granule is now spent rather than only priced.
+
 Three findings are encoded as behaviour rather than as comments:
 
 1. **LRU earns literally nothing on a cyclic scan.** A decoder's access pattern
@@ -777,6 +794,75 @@ bytes, adds a copy, and changes nothing about the access pattern. Route 1 did
 exactly that and measured the result. What the DPU can contribute is the *fault
 path* -- granule, read-ahead, eviction policy and the honest numbers above --
 applied to the file the model already lives in.
+
+## The granule is now a read path, and not a table
+
+For as long as the 5.4x figure has existed it has been a row in a benchmark
+table and a third argument to `plan`. Nothing in the read path ever took one.
+A fault path could have been written that read a whole granule on a miss and
+then dropped it, and every number in this file would have been unchanged --
+which is exactly the gap that let the hardcoded `0.08` and the probe count go
+stale twice.
+
+`residency.Faults(Backend)` is that read path. It is a scheduler-backed cache
+that fetches a whole granule on a miss and serves the rest of it from RAM:
+
+```zig
+const F = residency.Faults(blockdev.BlockDevice);
+var faults = try F.init(allocator, &pool.dev, .{
+    .granule = 64 * 1024,     // the policy the table was measuring
+    .capacity_bytes = ...,    // what stays resident
+    .read_ahead = ...,        // `PowerMode.prefetchDepth`
+});
+const n = try faults.read(offset, buf);
+```
+
+`Backend` is a comptime parameter rather than a stored pointer, so the error
+set stays inferred from the backend instead of erased to `anyerror`, and
+`residency` still imports nothing from the backend and is still testable with
+no device present. `Scheduler` gained one accessor, `slotOf`, because a fault
+path owns the bytes and needs to know which slot they are in; `access` and
+`load` answer only "is it resident", which is the question the policy is about.
+
+Four rules, each of which was a bug first:
+
+1. **A request at least as large as the granule bypasses the cache.** It is
+   already fault-sized; buffering it allocates a slab the caller immediately
+   overwrites and reports misses for reads that were never inefficient.
+2. **A short fetch is remembered as a short granule.** The tail past the end of
+   the working set is zeroed, `valid` is what gates the copy, and a later read
+   in that same granule is still a *hit* -- the bytes really are resident, they
+   just stop short.
+3. **The demand is served before read-ahead is fetched.** A speculative fetch
+   that fails is counted in `stats().skipped` and never takes the demand down
+   with it. An optimisation that can fail a read is not one.
+4. **The granule is a validated policy.** Zero, non-power-of-two, or below a
+   sector is refused with `InvalidGranule`, because `offset / granule` has to be
+   a shift and every granule in the slab has to inherit the slab's alignment.
+
+`pool.zig` exposes it as `Pool.faults()` and `Pool.Faults`, deliberately as a
+separate call rather than a flag on `Pool.read`: a fault path holds
+`capacity_bytes` of RAM resident for as long as it lives, and that is not a
+decision to make by accident on behalf of every caller.
+
+### The measured claim, reduced to arithmetic
+
+Eleven tests cover the fault path, and one of them is the benchmark's claim as
+a thing that can be checked by anyone: walk 256 KiB in 4 KiB reads at a 4 KiB
+granule and at a 64 KiB granule, and the backend is asked for **64 times versus
+4**, with **the same 262144 bytes** either way. That is the whole of the 5.4x --
+not a throughput model, a count of round trips.
+
+The other ten pin the parts that are easy to get quietly wrong: the short tail,
+the bypass, eviction observed through the map rather than the counter, read-ahead
+stopping at a known extent, and a read-ahead failure leaving the demand intact.
+
+`bench.zig` grew `measureFaultPath`, which walks a real region through the
+shipped path at two granules so the figure is a property of this code rather
+than of the device. **It has not been run**: the benchmark aborts at the 4096
+MiB sweep row before reaching it, on this branch and on `origin/main` alike.
+It compiles and is wired into `measureGranules`, and it is the first thing to
+run once the volume has room for the sweep.
 
 ## Unlinking the pool did not give the space back, and it was not NTFS
 
@@ -939,32 +1025,49 @@ That list is now closed: `vkEnumerateInstanceVersion` is implemented, the loader
 confirms the manifest's 1.3, and the interface version moved to 5 to match. See
 the section on the loader/ICD handle contract above.
 
-0. **Wire the residency scheduler to a real fault path.** It exists, it is
-   tested, and nothing calls it yet -- `prefetchDepth` is now a page count for
-   `residency.Scheduler.read_ahead` rather than a display value, but no client
-   faults through it. Until one does, the plan table is a prediction and not a
-   measurement, and the difference matters.
-1. **Retire #5, #6 and #7.** They are fully contained in #8. Closing them is the
+0. ~~**Wire the residency scheduler to a real fault path.**~~ **Done, with one
+   honest gap.** `residency.Faults(Backend)` is a real read path: a miss fetches
+   a whole granule, the rest is served from RAM, and `Pool.faults()` exposes it
+   over the real block device. The gap is that **no production client routes
+   through it yet** -- the benchmark's `measureFaultPath` does, and the eleven
+   new tests do, but the ICD reads through `blockdev` directly and nothing in
+   the engine calls `Pool.faults`. So the plan table is still a *prediction*;
+   what is no longer a prediction is the granule, which is now a counted
+   round-trip saving rather than a device row.
+1. **Fix the sweep's stale headroom budget.** The benchmark takes its headroom
+   once, before the first row, and every row then commits its bytes to the same
+   volume -- so the last row is sized against a budget that is out of date by
+   everything before it. On a volume with 6.26 GiB free that is the difference
+   between printing a partial curve and dying with `PoolOutOfSpace`, and it
+   costs the whole run including every row that already succeeded. Reproduced on
+   `origin/main`, so it is not new. The fix is to re-read free space per row
+   and subtract the pool's own extent, not to widen the reserve or skip rows.
+2. **Run the 9B at 64k end to end.** It still has never been executed. Every
+   number in that section is `residency.plan` arithmetic over measured device
+   constants, not a measurement of a model generating tokens. At the rate the
+   plan predicts it is hours, which is exactly why it needs doing on a machine
+   that is not the one doing the work.
+3. **Retire #5, #6 and #7.** They are fully contained in #8. Closing them is the
    user's call, not the agent's.
-2. **Multi-segment pool** — the tier resolver sums free space across roots and
+4. **Multi-segment pool** — the tier resolver sums free space across roots and
    holds `RESERVE_BYTES` per volume (PR #1), but the pool is still a single file
    on a single volume, so nothing is gained on disk yet.
-3. **Process-level pool locking test** — existing tests prove a *thread* releases
+5. **Process-level pool locking test** — existing tests prove a *thread* releases
    `Local\DPU.pool.lock`; none proves two *processes* cannot corrupt `pool.vram`.
-4. **Run the benchmark in CI.** Every number above is from one run on one machine.
+6. **Run the benchmark in CI.** Every number above is from one run on one machine.
    Nothing re-measures it, so the next edit can quietly make it stale the way the
    hardcoded `0.08` did — as the probe count already did once.
-5. **Extend the wire suite where the claims are still unchecked.** It covers
+7. **Extend the wire suite where the claims are still unchecked.** It covers
    every route the dashboard can reach, and nothing else: there is no route yet
    that takes a body, no keep-alive, and no concurrent client. Each of those is
    a claim someone will eventually make, and the suite should already be red when
    they start.
-6. **Assert the `buffer` values, not just its keys — on the write path.** The
+8. **Assert the `buffer` values, not just its keys — on the write path.** The
    sixteen fields are now covered with a pool open, but that pool is fresh and
    never written to, so every counter it reports is a zero. The same test with a
    pool that has actually absorbed and read back blocks would cover the sampler
    arithmetic, which nothing in the gate touches today.
-7. **Measure the iGPU baseline -- the one number that decides Route 1.** The
+9. **Measure the iGPU baseline -- the one number that decides Route 1.** The
    iGPU does have a working Vulkan driver (`igvk64.dll`, apiVersion 1.3.280,
    130 extensions, and it returns `VK_SUCCESS` from `vkCreateComputePipelines`),
    so the 10-40 TPS target can be measured on hardware rather than argued about

@@ -14,20 +14,20 @@ repository landing page, see the [root README](../README.md).
 
 ```sh
 zig build            # engine  -> zig-out/bin/dpu.exe
-zig build test       # 133 tests: block device, allocator, tiers, residency, ICD
+zig build test       # 144 tests: block device, allocator, tiers, residency, ICD
 zig build test-vkabi # 7 assertions about the vendored Vulkan headers
 zig build icd        # -> zig-out/bin/{dpu_icd.dll, vk_icd.json, dpu-vulkan.cmd}
 zig build bench      # real flushed device throughput against P:\
 zig build run        # engine + dashboard
 zig build probe      # load the real Vulkan loader and verify the DPU enumerates
-zig build check      # the gate: fmt, 140 tests, ABI assertions, both binaries
+zig build check      # the gate: fmt, 151 tests, ABI assertions, both binaries
 ```
 
 The dashboard is at `http://127.0.0.1:8787`. The capacity pool is optional: if
 `P:\` is missing the engine still boots and simply reports no buffer.
 
 `zig build check` is the gate, and it currently reports **17/17 steps,
-140/140 tests, exit 0**. It builds both shipped binaries -- `dpu.exe` and
+151/151 tests, exit 0**. It builds both shipped binaries -- `dpu.exe` and
 `dpubench` -- so a green run means the artifacts people actually run compile,
 not merely that the tests compiled. It used not to: a local `const` shadowed a
 top-level `fn`, so `zig build bench` had stopped compiling while the gate stayed
