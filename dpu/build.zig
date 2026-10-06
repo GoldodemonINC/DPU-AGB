@@ -130,6 +130,18 @@ pub fn build(b: *std.Build) void {
     alloc_mod.addImport("blockdev", blockdev_mod);
     alloc_mod.addImport("tiers", tiers_mod);
 
+    // The residency policy and its feasibility arithmetic. It imports nothing
+    // from the backend on purpose: it is the decision layer over a working set,
+    // and keeping it free of handles is what lets it be tested as arithmetic
+    // rather than against a device. `tiers` is the same shape for the same
+    // reason.
+    const residency_mod = b.createModule(.{
+        .root_source_file = b.path("src/backend/residency.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     // There used to be two more copies of these four modules here -- ReleaseFast
     // twins for the benchmark and ReleaseSmall twins for the driver -- because
     // a module's optimise mode is fixed where it is declared, and the shared
@@ -151,6 +163,7 @@ pub fn build(b: *std.Build) void {
     root.addImport("tiers", tiers_mod);
     root.addImport("blockdev", blockdev_mod);
     root.addImport("alloc", alloc_mod);
+    root.addImport("residency", residency_mod);
 
     // PDH for counters, PSAPI for per-process memory, Winsock for the dashboard
     // socket. These are the only three external dependencies in the project.
@@ -194,6 +207,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addImport("tiers", tiers_mod);
     test_mod.addImport("blockdev", blockdev_mod);
     test_mod.addImport("alloc", alloc_mod);
+    test_mod.addImport("residency", residency_mod);
     test_mod.linkSystemLibrary("pdh", .{});
     test_mod.linkSystemLibrary("psapi", .{});
     test_mod.linkSystemLibrary("ws2_32", .{});
@@ -222,6 +236,13 @@ pub fn build(b: *std.Build) void {
     const tiers_tests = b.addTest(.{ .root_module = tiers_mod });
     const run_tiers_tests = b.addRunArtifact(tiers_tests);
     test_step.dependOn(&run_tiers_tests.step);
+
+    // Same reason again: the residency policy is a named module, so Zig would
+    // not discover its tests from the backend root and sixteen assertions
+    // would go quiet without anything going red.
+    const residency_tests = b.addTest(.{ .root_module = residency_mod });
+    const run_residency_tests = b.addRunArtifact(residency_tests);
+    test_step.dependOn(&run_residency_tests.step);
 
     // Likewise for the driver: memory.zig's alignment and heap-index
     // assertions are only reachable when the ICD itself is the test root.
@@ -264,6 +285,7 @@ pub fn build(b: *std.Build) void {
     bench_mod.addImport("win", win_mod);
     bench_mod.addImport("tiers", tiers_mod);
     bench_mod.addImport("blockdev", blockdev_mod);
+    bench_mod.addImport("residency", residency_mod);
     bench_mod.addImport("alloc", alloc_mod);
     bench_mod.linkSystemLibrary("pdh", .{});
     bench_mod.linkSystemLibrary("psapi", .{});
@@ -413,6 +435,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(b.getInstallStep());
     check_step.dependOn(&run_tests.step);
     check_step.dependOn(&run_tiers_tests.step);
+    check_step.dependOn(&run_residency_tests.step);
     check_step.dependOn(&run_icd_tests.step);
     check_step.dependOn(&b.addRunArtifact(abi_tests).step);
 }

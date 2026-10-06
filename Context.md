@@ -5,11 +5,11 @@ applications as a discrete GPU through a user-mode installable client driver.
 
 ## Status at this commit
 
-`zig build check` — **111/111 tests**, exit 0, `zig fmt --check` clean. The gate
+`zig build check` — **133/133 tests**, exit 0, `zig fmt --check` clean. The gate
 also builds `dpu.exe`, so a green run now means the shipping binary compiles.
 
-`zig build probe` — **50/50, exit 0**, closing with
-`PROBE_SUMMARY: total=50 passed=50 failed=0 result=PASS` and
+`zig build probe` — **51/51, exit 0**, closing with
+`PROBE_SUMMARY: total=51 passed=51 failed=0 result=PASS` and
 `RESULT: PASS -- the DPU heap carries real bytes on disk`.
 
 Every number here was measured on this machine for this tree. An earlier copy of
@@ -653,6 +653,142 @@ was never part of the submission. A client wanting a fence submits through
 returns, `vkQueueWaitIdle` is already satisfied for a client that waits that
 way.
 
+## What 9B at 64k actually costs, measured
+
+The second diagram asks for something specific: 128 MB of VRAM plus 8 GB of RAM
+**cannot** run a 9B model at 64k context today, and with the DPU added it should
+**run**, at 0.7-6 tok/s. That is a claim about capacity and a claim about speed,
+and they turn out to have different answers.
+
+### The working set is per token, and the cache is the big half
+
+A decoder touches every weight once per token and then starts again, and
+attention reads the whole key/value history. So the bytes that matter are per
+token, not once:
+
+| | 3B (Llama-3.2) | 9B (gemma-2) |
+| --- | --- | --- |
+| layers / KV heads / head_dim | 28 / 8 / 128 | 42 / 8 / 256 |
+| KV bytes per token, f16 | 114,688 | 344,064 |
+| KV at 64k, f16 | **7.5 GB** | **22.5 GB** |
+| weights, f16 | 6.4 GB | 18.5 GB |
+| weights, q4 | 1.6 GB | 4.6 GB |
+
+At 64k the cache is the dominant term at both sizes, and it is the thing that
+makes the top row of the diagram true. The weights are the small half.
+
+### What the device actually does
+
+`zig build bench`, 2026-10-05. The volume sits behind a RAID controller with a
+large cache, so the small rows are measuring that cache and not the disk. The
+sweep now drops any row the volume cannot hold beside the pool's own reserve,
+and says so, rather than failing the whole run:
+
+| working set | write MB/s | read MB/s | rnd 4 KiB us |
+| --- | --- | --- | --- |
+| 64 MiB | 247 | 4860 | 4.5 |
+| 1024 MiB | 268 | 4515 | 4.4 |
+| 2048 MiB | 209 | 347 | 39.3 |
+| **4096 MiB** | 182 | **427** | 57.6 |
+| 8192 MiB | *skipped* -- needs 8.0 GB, headroom was 6.0 GB | | |
+
+**Run-to-run variance is real and is not noise to average away.** An earlier run
+the same day read 412.7 MB/s at 4096 MiB and 470.8 at 8192, and 4104 MB/s at
+2048 MiB where this one reads 347 -- the controller's cache state moves the cold
+boundary between 2 and 4 GiB. The device is therefore **roughly 400-500 MB/s
+sequential**, and every plan below is computed against the lowest device-sized
+row of *its own* run rather than a remembered number.
+
+Against RAM at 4004 MB/s memcpy and 0.100 us random, the pool's uncached random
+access is **57.6 us, or 576x slower**. That ratio, not the bandwidth, is the
+design constraint.
+
+### The granule is worth 5.4x on its own
+
+A scheduler does not read a file, it *faults*. One read in flight, same 4 GiB
+set, only the transfer size varying:
+
+| granule | read MB/s | per-read us |
+| --- | --- | --- |
+| 4 KiB | **106.8** | 36.5 |
+| 16 KiB | 289.2 | 54.0 |
+| 64 KiB | 530.0 | 117.9 |
+| 256 KiB | 575.0 | 434.7 |
+| **1 MiB** | **580.5** | 1722.5 |
+
+Effective throughput rises **5.4x** from the granule alone at identical byte
+counts (6.7x in the earlier run). That is the entire reason `residency.zig` takes
+a granule as policy rather than reading whatever the caller asked for.
+
+### The plan, from those measured constants
+
+`residency.plan` is arithmetic over a working set, a RAM budget and a measured
+machine -- no model, no geometry, no victory condition. Fed the table above
+(36.5 us faults, streaming planned against the lower of the two device-sized read
+rates, 6 GiB resident of 7.79 GiB):
+
+| working set | at 4 KiB | at 1 MiB | tok/s | bound |
+| --- | --- | --- | --- | --- |
+| 3B q4/q4, 64k | RESIDENT | RESIDENT | -- | none |
+| 3B q4 / f16 KV, 64k | STREAMED | STREAMED | 0.167 | bandwidth |
+| 9B q4/q4, 64k | STREAMED | STREAMED | 0.117 | bandwidth |
+| **9B f16, 64k** | **DOES NOT FIT** | **DOES NOT FIT** | **0.000** | none |
+
+The row the diagram is about is the last one, and it fails on **capacity, not
+speed**: 41.0 GB of working set against an 8 GiB pool ceiling and 13 GB free on
+`P:\`. No eviction policy recovers that, which is why the verdict is not
+`streamed` with a small number but `does_not_fit` with none.
+
+### What that means for the 0.7-6 tok/s claim
+
+- **"Can't run" -> "can run" is real, and it is the capacity half.** At 4 bits
+the 9B working set is 10.3 GB and streams. That is the diagram's headline and it
+holds.
+- **0.7 tok/s is not reachable at 9B/64k on this machine, and 6 is not close.**
+The 9B q4 row lands at **0.117 tok/s**, on a run whose device read rate was the
+optimistic end of the observed range. Raising it means moving fewer bytes per
+token, and at 64k the cache is 55% of the working set before quantisation is
+even considered. Quantising the *cache* is the lever, not the weights, and it is
+a model-side decision that no amount of DPU policy can make.
+- **6 tok/s requires the working set resident, not paged.** At a 427 MB/s device
+the budget is ~330 MB of misses per token, against a 5.6 GB f16 cache for the 3B
+alone. Only the `RESIDENT` row reaches that regime, and it does so without the
+pool: the third row of the table is what "fits" looks like.
+
+### The mechanism that does ship
+
+`src/backend/residency.zig` -- the layer `pool.zig` and `blockdev.zig` have
+referred to as "the residency scheduler" since before it existed. It is policy
+and arithmetic only: it imports nothing from the backend, holds no handles, and
+is tested as arithmetic rather than against a device.
+
+Three findings are encoded as behaviour rather than as comments:
+
+1. **LRU earns literally nothing on a cyclic scan.** A decoder's access pattern
+is every page once, then again, over a set larger than the cache -- the case
+where LRU evicts precisely the page it needs next. Two tests pin this: the same
+trace gives **0 hits** under `Policy.lru` and **8 hits** under `Policy.pinned`
+at the same capacity. This is why handing the weights to the pool made decoding
+slower, and `Policy.pinned` is the fix.
+2. **Fault latency and bandwidth bind separately.** The planner computes both and
+takes the maximum, so a device with a fast round trip and a slow stream is not
+modelled as fast. At 4 KiB the plan is fault-bound and at 1 MiB it is
+bandwidth-bound -- from the same machine, on the same bytes.
+3. **An unmeasured rate degrades to the measured limit, not to infinity.** A
+machine with no streaming figure plans against `granule / fault_us`, which is a
+genuine lower bound on cost. Reporting `inf` would be defensible arithmetic and
+a module nobody could use.
+
+### The correction that the measurement forced
+
+The pool is the **wrong place to store the weights**, and this is a design
+conclusion rather than a tuning one. A GGUF on disk is already a random-access
+backing store; copying it into `pool.vram` doubles the storage for the same
+bytes, adds a copy, and changes nothing about the access pattern. Route 1 did
+exactly that and measured the result. What the DPU can contribute is the *fault
+path* -- granule, read-ahead, eviction policy and the honest numbers above --
+applied to the file the model already lives in.
+
 ## What comes next
 
 **The guard is now in place, and the probe count went from 50 to 51.** The probe
@@ -694,6 +830,11 @@ One item from that list is still open: add `vkEnumerateInstanceVersion` so
 `vk_icd.json` can honestly declare 1.3. Without it the loader logs `treating as
 a 1.0 ICD`, because the manifest's declared API version is never confirmed.
 
+0. **Wire the residency scheduler to a real fault path.** It exists, it is
+   tested, and nothing calls it yet -- `prefetchDepth` is now a page count for
+   `residency.Scheduler.read_ahead` rather than a display value, but no client
+   faults through it. Until one does, the plan table is a prediction and not a
+   measurement, and the difference matters.
 1. **Retire #5, #6 and #7.** They are fully contained in #8. Closing them is the
    user's call, not the agent's.
 2. **Multi-segment pool** — the tier resolver sums free space across roots and
