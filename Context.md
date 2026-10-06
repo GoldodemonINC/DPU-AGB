@@ -11,11 +11,12 @@ so a green run means both shipped binaries compile. The eleven tests the granule
 fault path added are unchanged; the one this branch adds is the OpenGL backend's
 contract pin, which is a compile-time assertion and so needs no display.
 
-`zig build gl-test` — **8/8 tests**, exit 0, and it is deliberately *not* in
+`zig build gl-test` — **11/11 tests**, exit 0, and it is deliberately *not* in
 `check`. It creates a real WGL context, so it needs a live WindowStation and
 hangs rather than fails without one -- the same reason the Vulkan probe is not in
 the gate. On this machine it passes; the GL backend's section below has the
-detail, including the one new test that proves a real `glReadPixels` ran.
+detail, including the test that proves a real `glReadPixels` ran and the two
+that pin the read-path fixes the CodeRabbit review forced.
 
 `zig build probe` — **61/61, exit 0**, closing with
 `PROBE_SUMMARY: total=61 passed=61 failed=0 result=PASS` and
@@ -920,17 +921,24 @@ var faults = try F.init(allocator, &backend, .{ .granule = 64 * 1024, ... });
 ```
 
 **What it is.** A read backend and nothing else. No swapchain, no shader, no
-present, no video-memory allocation; the context is hidden and never shown, and
-the bytes it returns are whatever the framebuffer already holds -- cleared to
-black on init. `read` treats the byte offset as a row-major RGBA pixel offset
-(4 bytes per pixel) and returns the byte count actually read, which is short at
-the edge of the surface. That short tail is the same shape the fault path
-already handles for the pool's last granule, which is why it is a drop-in.
+present, no video-memory allocation. It registers a window class, creates a
+hidden window and a WGL context of its own, and clears that context's
+framebuffer to black; the bytes `read` returns come from *that* surface and
+nowhere else -- not the host's desktop, not another program's render, and not
+model weights. A caller that wants real data has to put real data in the surface
+first. `read` treats the byte offset as a row-major RGBA pixel offset (4 bytes
+per pixel), returns the pixels in linear order even across a row boundary, and
+returns the byte count actually read, which is short at the edge of the surface.
+That short tail is the same shape the fault path already handles for the pool's
+last granule, which is why it is a drop-in.
 
-**What it is not.** A replacement for the Vulkan ICD. The ICD owns a device-local
-heap backed by the disk pool; this reads the framebuffer of the host's existing
-GL context. Different devices for different purposes, and the fault path can be
-backed by either.
+**What it is not.** A replacement for the Vulkan ICD, and not a reader of
+somebody else's GL context. The ICD owns a device-local heap backed by the disk
+pool; this reads a framebuffer that belongs to a window it created itself. The
+early draft of this file said "the host's existing GL context", which is wrong
+and would lead a caller to expect existing application pixels; the review caught
+it and it is corrected here, in `gl.zig` and in `build.zig`. Different devices
+for different purposes, and the fault path can be backed by either.
 
 ### The claim is a compile error if it stops being true
 
@@ -970,6 +978,46 @@ are both zero. A new test clears the framebuffer to `(0.25, 0.5, 0.75, 1.0)` and
 asserts the channels come back as `64, 128, 191, 255` within +/-2, which
 undefined memory cannot produce. Partial-edge reads (byte 262140 returning 4, not
 8) and 4 KiB-aligned reads are covered as well.
+
+### The review found four real defects in the read path
+
+CodeRabbit's review of PR #19 changed the backend, and the read path is the part
+worth recording, because its bugs were silent -- each returned a plausible byte
+count with the wrong bytes behind it.
+
+1. **A read is linear; `glReadPixels` reads a rectangle.** A range that started
+   at the last pixel of a row and continued into the next returned the last
+   *column* of two rows, not the end of one row followed by the start of the
+   next. `read` now issues one call per row when the range does not line up with
+   rows, and keeps the single-call fast path for reads that start on a row
+   boundary and cover whole rows -- which is every granule-aligned fault.
+2. **An offset past the end of the surface underflowed `height - py`** and
+   trapped in a safety-checked build instead of returning "nothing to read". The
+   fault path's read-ahead can ask past the end of a finite working set, so this
+   was reachable rather than theoretical.
+3. **The current-context check ran *after* the GL calls it guards.** WGL routes
+   GL calls to whatever context is current on the calling thread, so a check
+   that runs afterwards has already read the wrong surface. It is now the first
+   thing `read` does.
+4. **`glReadPixels` failures were invisible.** A GL error left the buffer
+   untouched and the old code still returned a byte count. There is now a
+   `glGetError` check that returns `GlReadFailed`, because a silent wrong byte
+   count is the one failure the fault path cannot detect.
+
+Three more were lifecycle rather than data. The window was
+`WS_OVERLAPPEDWINDOW`, whose client area -- the actual drawable -- is smaller
+than the `256x256` the backend advertised, so `read` addressed rows and columns
+that did not exist; it is now `WS_POPUP` with the size read back from
+`GetClientRect`. The window class is process-global, so a second backend in the
+same process failed to initialise and a sibling's `deinit` unregistered the
+class out from under a live one; a refcount now shares it and releases it only
+when the last backend goes. And a failed `init` leaked the window and its DC;
+`errdefer` now unwinds what it acquired.
+
+Each fix has a test that fails without it, and the row-crossing one was checked
+the way this file checks every gate: the fix was reverted, the test went red on
+the green channel of the pixel from the second row, and restoring the fix made
+it pass again.
 
 ### The MinGW translate-c workarounds, itemised
 

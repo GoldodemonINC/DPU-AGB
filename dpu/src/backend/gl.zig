@@ -1,33 +1,36 @@
 //! An OpenGL backend for the DPU residency fault path.
 //!
 //! This is a *read* backend for `residency.Faults`, not a device driver.
-//! It creates a hidden WGL context on the host's GPU and reads the
-//! framebuffer with `glReadPixels`, so the fault path can pull a whole granule
-//! out of video memory in one call instead of 4 KiB at a time through the disk
-//! pool.
+//! It creates a hidden window and a WGL context of its own on the host's GPU
+//! and reads *that window's* framebuffer with `glReadPixels`, so the fault path
+//! can pull a whole granule in one call instead of 4 KiB at a time through the
+//! disk pool.
 //!
 //! What this is, precisely:
 //! - A drop-in backend for `residency.Faults(GLBackend)`. Any call site that
 //!   can talk to `blockdev.BlockDevice` can talk to this, because both expose
 //!   `read(self: *Backend, offset: u64, buf: []u8)`.
-//! - A way to test the granule hypothesis on the *real* GPU, not just on the
-//!   disk pool. The hypothesis is that one `glReadPixels` of a granule is
+//! - A way to exercise the granule read path on a *real* GPU rather than only
+//!   on the disk pool. The hypothesis is that one `glReadPixels` of a granule is
 //!   cheaper than N `glReadPixels` calls of 4 KiB each, the same shape as the
 //!   disk sweep found for the pool.
-//! - **Not** a replacement for the Vulkan ICD. The Vulkan ICD owns a
-//!   device-local heap backed by the disk pool; this backend reads from the
-//!   framebuffer of the host's existing GL context. They are different devices
-//!   for different purposes.
+//! - **Not** a replacement for the Vulkan ICD. The ICD owns a device-local heap
+//!   backed by the disk pool; this reads a framebuffer belonging to a window
+//!   this backend created. They are different devices for different purposes.
 //!
 //! What this is not:
-//! - It does not allocate video memory. `glReadPixels` reads what the context
-//!   can see, which on a fresh context is whatever was last on the screen or
-//!   a cleared buffer. The caller owns the interpretation of those bytes.
-//! - It does not present, swap, or render. There is no swapchain, no shader,
-//!   no pipeline. The context is hidden and never shown.
-//! - It is not thread-safe. WGL contexts are thread-affine and the backend
-//!   holds a single context for its lifetime. Two backends in two threads each
-//!   get their own context; one backend used from two threads is undefined.
+//! - **It does not read another application's GL context.** `createSurface`
+//!   registers a window class, creates a window and a WGL context, and clears
+//!   that context's framebuffer to black. The bytes `read` returns come from
+//!   this backend's own framebuffer and nowhere else -- they are not the host's
+//!   desktop, not another program's render, and not model weights. A caller
+//!   that wants real data has to put real data in this surface first.
+//! - It does not allocate video memory, present, swap, or render. There is no
+//!   swapchain, no shader, no pipeline. The context is hidden and never shown.
+//! - It is not thread-safe. WGL contexts are thread-affine and the backend holds
+//!   a single context for its lifetime. Two backends in two threads each get
+//!   their own context (see `class_refs` for why that works at all); one backend
+//!   used from two threads is undefined.
 
 const std = @import("std");
 const win = @import("win");
@@ -46,6 +49,53 @@ const ogl = @cImport({
 // 32-bit integer in every OpenGL implementation this targets.
 const GLsizei = i32;
 
+const CLASS_NAME = "DPUGLBackend";
+
+// ----------------------------------------------------------------------------
+// Window class sharing
+// ----------------------------------------------------------------------------
+
+/// How many live backends share the process-wide window class.
+///
+/// A window class is process-global, not per-context: the second backend in a
+/// process finds the name already registered and `RegisterClassExA` fails with
+/// `ERROR_CLASS_ALREADY_EXISTS`. That is not an error -- it means a sibling (or
+/// a previous instance that has not finished tearing down) owns the name -- so
+/// it is treated as success. The count tracks live backends and the class is
+/// unregistered only when the last one goes, because a backend that unregisters
+/// the class out from under a live sibling is a bug, not cleanup.
+var class_refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+fn registerWindowClass() !void {
+    const wc = c.WNDCLASSEXA{
+        .cbSize = @sizeOf(c.WNDCLASSEXA),
+        .style = c.CS_HREDRAW | c.CS_VREDRAW,
+        .lpfnWndProc = @ptrCast(&defWindowProc),
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = c.GetModuleHandleA(null),
+        // Raw resource IDs: IDI_APPLICATION and IDC_ARROW are MinGW `func##A`
+        // macros that translate-c cannot resolve. Both are 32512 in winuser.h.
+        .hIcon = c.LoadIconA(null, @ptrFromInt(@as(usize, 32512))),
+        .hCursor = c.LoadCursorA(null, @ptrFromInt(@as(usize, 32512))),
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = CLASS_NAME,
+        .hIconSm = null,
+    };
+    if (c.RegisterClassExA(&wc) == 0) {
+        if (c.GetLastError() != c.ERROR_CLASS_ALREADY_EXISTS) return error.GlContextFailed;
+    }
+    _ = class_refs.fetchAdd(1, .monotonic);
+}
+
+fn releaseWindowClass() void {
+    // `fetchSub` returns the previous value, so 1 means this was the last one.
+    if (class_refs.fetchSub(1, .monotonic) == 1) {
+        _ = c.UnregisterClassA(CLASS_NAME, c.GetModuleHandleA(null));
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Context creation
 // ----------------------------------------------------------------------------
@@ -62,54 +112,59 @@ pub const Backend = struct {
     /// The last error from a `read`, so a caller can distinguish "nothing to
     /// read" from "the context died".
     last_error: ?[]const u8 = null,
+    /// Guards `deinit`, so a double release cannot unregister the shared window
+    /// class a sibling still needs.
+    released: bool = false,
 
     /// Create a hidden window + GL context.
     ///
     /// The window is invisible and never shown. It exists solely so WGL has a
-    /// DC to make current. On failure the backend is left in a state where
-    /// every `read` returns an error rather than crashing.
+    /// DC to make current. On failure every resource acquired on the way is
+    /// released before the error is returned, so a failed init leaves nothing
+    /// behind and a caller that never sees a Backend has nothing to clean up.
     pub fn init(allocator: std.mem.Allocator) !Backend {
         var self = Backend{ .allocator = allocator };
-        try self.createContext();
+        try registerWindowClass();
+        errdefer releaseWindowClass();
+        try self.createSurface();
         return self;
     }
 
-    fn createContext(self: *Backend) !void {
-        const wc = c.WNDCLASSEXA{
-            .cbSize = @sizeOf(c.WNDCLASSEXA),
-            .style = c.CS_HREDRAW | c.CS_VREDRAW,
-            .lpfnWndProc = @ptrCast(&defWindowProc),
-            .cbClsExtra = 0,
-            .cbWndExtra = 0,
-            .hInstance = c.GetModuleHandleA(null),
-            .hIcon = c.LoadIconA(null, @ptrFromInt(@as(usize, 32512))),
-            .hCursor = c.LoadCursorA(null, @ptrFromInt(@as(usize, 32512))),
-            .hbrBackground = null,
-            .lpszMenuName = null,
-            .lpszClassName = "DPUGLBackend",
-            .hIconSm = null,
-        };
-        if (c.RegisterClassExA(&wc) == 0) return error.GlContextFailed;
-
+    /// Create the window, its DC, and the GL context, and clear the surface.
+    /// On failure the partial state is torn down via `errdefer`.
+    fn createSurface(self: *Backend) !void {
+        // WS_POPUP, not WS_OVERLAPPEDWINDOW: an overlapped window's *client*
+        // area is smaller than its outer rect (title bar and borders), and the
+        // GL drawable is the client area, so `read` would address rows and
+        // columns that do not exist. A popup has no non-client frame, and the
+        // real client size is read back below rather than assumed.
         self.hwnd = c.CreateWindowExA(
             0,
-            "DPUGLBackend",
+            CLASS_NAME,
             "dpu-gl-backend",
-            c.WS_OVERLAPPEDWINDOW,
+            c.WS_POPUP,
             0,
             0,
             @intCast(self.width),
             @intCast(self.height),
             null,
             null,
-            wc.hInstance,
+            c.GetModuleHandleA(null),
             null,
         );
         if (self.hwnd == null) return error.GlContextFailed;
+        errdefer {
+            _ = c.DestroyWindow(self.hwnd.?);
+            self.hwnd = null;
+        }
 
         const dc = c.GetDC(self.hwnd.?);
         if (dc == null) return error.GlContextFailed;
         self.dc = dc;
+        errdefer {
+            _ = c.ReleaseDC(self.hwnd.?, dc);
+            self.dc = null;
+        }
 
         const pfd: c.PIXELFORMATDESCRIPTOR = .{
             .nSize = @sizeOf(c.PIXELFORMATDESCRIPTOR),
@@ -127,6 +182,9 @@ pub const Backend = struct {
             .cAlphaShift = 0,
             .cAccumBits = 0,
             .cAccumRedBits = 0,
+            // The translated MinGW PIXELFORMATDESCRIPTOR drops the four
+            // cAccum*Shift fields the canonical Win32 struct has, so the
+            // literal is trimmed to the fields the header actually defines.
             .cAccumGreenBits = 0,
             .cAccumBlueBits = 0,
             .cAccumAlphaBits = 0,
@@ -147,33 +205,51 @@ pub const Backend = struct {
 
         const ctx = c.wglCreateContext(dc);
         if (ctx == null) return error.GlContextFailed;
-
-        if (c.wglMakeCurrent(dc, ctx) == 0) {
-            _ = c.wglDeleteContext(ctx);
-            return error.GlContextFailed;
-        }
         self.ctx = ctx;
+        errdefer {
+            _ = c.wglDeleteContext(ctx);
+            self.ctx = null;
+        }
+
+        if (c.wglMakeCurrent(dc, ctx) == 0) return error.GlContextFailed;
+
+        // Read the drawable size back instead of trusting the requested one.
+        // DPI virtualisation can scale a window, and the drawable is the client
+        // rect; addressing anything outside it is undefined.
+        var rect: c.RECT = undefined;
+        if (c.GetClientRect(self.hwnd.?, &rect) != 0) {
+            const cw: u32 = @intCast(@max(rect.right - rect.left, 0));
+            const ch: u32 = @intCast(@max(rect.bottom - rect.top, 0));
+            if (cw > 0 and ch > 0) {
+                self.width = cw;
+                self.height = ch;
+            }
+        }
 
         // Clear to a known state so a fresh backend does not return whatever
-        // was on the screen before it started.
+        // the driver left in the buffer.
         ogl.glClearColor(0.0, 0.0, 0.0, 0.0);
         ogl.glClear(ogl.GL_COLOR_BUFFER_BIT);
     }
 
     /// Read `buf.len` bytes at `offset` from the framebuffer.
     ///
-    /// The offset is interpreted as a row-major pixel offset into a
-    /// `width x height` framebuffer of RGBA pixels (4 bytes each). A read of
-    /// N bytes therefore reads N/4 pixels from pixel index `offset/4`.
+    /// The offset is a linear byte offset into the surface, which is a
+    /// row-major array of `width x height` RGBA pixels (4 bytes each). A read of
+    /// N bytes reads N/4 pixels starting at pixel index `offset/4`. The pixels
+    /// come back in linear order even when the range crosses a row boundary --
+    /// that is the contract `blockdev.BlockDevice` keeps, and a backend that
+    /// broke it would hand the fault path plausible bytes that are wrong.
     ///
-    /// The buffer must be 4-byte aligned, because `glReadPixels` with
+    /// The buffer length must be a multiple of 4, because `glReadPixels` with
     /// `GL_UNSIGNED_BYTE` and `GL_PACK_ALIGNMENT = 4` requires it. This is the
     /// same alignment contract `blockdev` imposes for `NO_BUFFERING`, and the
     /// residency slab is allocated to it, so a fault path backed by either
     /// device can use the same slab.
     ///
-    /// Returns the caller's byte count, or an error when the context is gone
-    /// or the read fails.
+    /// Returns the byte count actually read. A short count means the surface
+    /// ended inside the request; an offset at or past the end returns 0. A read
+    /// that fails returns an error rather than a byte count.
     pub fn read(self: *Backend, offset: u64, buf: []u8) !usize {
         if (self.ctx == null) {
             self.last_error = "context not current";
@@ -185,50 +261,103 @@ pub const Backend = struct {
             return error.GlNotAligned;
         }
 
-        // Pixel index = byte offset / 4 (RGBA = 4 bytes per pixel).
-        const pixel_index: u64 = offset / 4;
-        const px = @as(u32, @intCast(pixel_index % @as(u64, self.width)));
-        const py = @as(u32, @intCast(pixel_index / @as(u64, self.width)));
-        const width: GLsizei = @intCast(@min(@as(u64, self.width) - px, buf.len / 4));
-        const height: GLsizei = @intCast(@min(
-            @as(u64, self.height) - py,
-            @as(u64, buf.len / 4) / @as(u64, @intCast(width)),
-        ));
-
-        if (width == 0 or height == 0) return 0;
-
-        ogl.glPixelStorei(ogl.GL_PACK_ALIGNMENT, 4);
-        _ = ogl.glReadPixels(@intCast(px), @intCast(py), width, height, ogl.GL_RGBA, ogl.GL_UNSIGNED_BYTE, buf.ptr);
-
-        // A failed read leaves the buffer untouched and returns an error. We
-        // cannot tell from the return value alone whether glReadPixels fired,
-        // because GL errors are sticky and driver-dependent; the safest signal
-        // is that the context is still current.
+        // The current-context check has to come *before* any GL call, not
+        // after: WGL routes every GL call to whatever context is current on
+        // this thread, so a check that runs afterwards has already read from
+        // the wrong surface.
         if (c.wglGetCurrentContext() != self.ctx.?) {
-            self.last_error = "context lost during read";
+            self.last_error = "context not current on this thread";
             return error.GlContextLost;
         }
-        const bytes_read = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
-        return bytes_read;
+
+        const surface_px: u64 = @as(u64, self.width) * @as(u64, self.height);
+        const want_px: u64 = buf.len / 4;
+        var idx: u64 = offset / 4;
+        // At or past the end there is nothing to read, and returning here is
+        // what keeps `height - py` below from underflowing on a large offset.
+        if (idx >= surface_px) return 0;
+
+        // Drop any error left over from an earlier call, so the check below is
+        // about this read and nothing else.
+        while (ogl.glGetError() != ogl.GL_NO_ERROR) {}
+
+        ogl.glPixelStorei(ogl.GL_PACK_ALIGNMENT, 4);
+
+        var written_px: u64 = 0;
+        // Fast path: a request that starts on a row boundary and covers whole
+        // rows is exactly one rectangle, which is the shape every
+        // granule-aligned fault read takes. This is the case the backend exists
+        // to make cheap, so it must stay a single glReadPixels.
+        if (idx % @as(u64, self.width) == 0 and want_px % @as(u64, self.width) == 0) {
+            const rows = @min(
+                @as(u64, self.height) - idx / @as(u64, self.width),
+                want_px / @as(u64, self.width),
+            );
+            _ = ogl.glReadPixels(
+                0,
+                @intCast(idx / @as(u64, self.width)),
+                @intCast(self.width),
+                @intCast(rows),
+                ogl.GL_RGBA,
+                ogl.GL_UNSIGNED_BYTE,
+                buf.ptr,
+            );
+            written_px = rows * @as(u64, self.width);
+        } else {
+            // General path: glReadPixels reads a rectangle, not a linear range
+            // that wraps at the row edge. A range that starts mid-row or stops
+            // mid-row has to be issued one row at a time, or the caller gets
+            // the wrong columns.
+            while (written_px < want_px) {
+                const px = idx % @as(u64, self.width);
+                const py = idx / @as(u64, self.width);
+                if (py >= @as(u64, self.height)) break;
+                const run = @min(@as(u64, self.width) - px, want_px - written_px);
+                _ = ogl.glReadPixels(
+                    @intCast(px),
+                    @intCast(py),
+                    @intCast(run),
+                    1,
+                    ogl.GL_RGBA,
+                    ogl.GL_UNSIGNED_BYTE,
+                    buf.ptr + @as(usize, @intCast(written_px * 4)),
+                );
+                written_px += run;
+                idx += run;
+            }
+        }
+
+        // A GL error means the bytes in `buf` are not the ones the caller asked
+        // for, whether or not the context is still current. Reporting a byte
+        // count here would be the silent-wrong-data failure the fault path
+        // cannot detect, so it is an error instead.
+        if (ogl.glGetError() != ogl.GL_NO_ERROR) {
+            self.last_error = "glReadPixels failed";
+            return error.GlReadFailed;
+        }
+
+        return @intCast(written_px * 4);
     }
 
-    /// Resize the backing framebuffer. Called by the fault path when it wants
-    /// a larger surface to read from.
+    /// Resize the backing surface. Called by the fault path when it wants a
+    /// larger framebuffer to read from.
     pub fn resize(self: *Backend, width: u32, height: u32) void {
         if (self.ctx == null) return;
         self.width = width;
         self.height = height;
-        // Recreate the context on the new size. A window resize would require
-        // a buffer swap and a present, which this backend does not do; instead
-        // we tear down and rebuild, which is cheap for the hidden window this
-        // backend uses.
+        // Recreate the window and context at the new size. A window resize
+        // would need a buffer swap and a present, which this backend does not
+        // do; tearing down and rebuilding is cheap for a hidden window.
         self.destroyContext();
-        self.createContext() catch {
+        self.createSurface() catch {
             self.ctx = null;
             self.last_error = "resize failed";
         };
     }
 
+    /// Release the context, DC and window this backend owns. Idempotent, and
+    /// safe to call on a partially initialised backend. It does *not* touch the
+    /// window class, which is shared and outlives any one backend.
     fn destroyContext(self: *Backend) void {
         if (self.ctx) |ctx| {
             if (self.dc) |dc| {
@@ -238,23 +367,26 @@ pub const Backend = struct {
         }
         self.ctx = null;
         if (self.dc) |dc| {
-            _ = c.ReleaseDC(self.hwnd.?, dc);
+            if (self.hwnd) |hwnd| {
+                _ = c.ReleaseDC(hwnd, dc);
+            }
         }
         self.dc = null;
-    }
-
-    pub fn deinit(self: *Backend) void {
-        self.destroyContext();
         if (self.hwnd) |hwnd| {
             _ = c.DestroyWindow(hwnd);
         }
-        // UnregisterClass is best-effort here; a leaked class atom is not a
-        // resource leak in the sense this project usually means.
-        _ = c.UnregisterClassA("DPUGLBackend", c.GetModuleHandleA(null));
+        self.hwnd = null;
+    }
+
+    pub fn deinit(self: *Backend) void {
+        if (self.released) return;
+        self.released = true;
+        self.destroyContext();
+        releaseWindowClass();
     }
 
     pub fn valid(self: *const Backend) bool {
-        return self.ctx != null;
+        return self.ctx != null and !self.released;
     }
 
     pub fn info(self: *const Backend) Info {
@@ -286,6 +418,10 @@ pub const Error = error{
     GlContextFailed,
     GlContextLost,
     GlNotAligned,
+    /// `glReadPixels` reported a GL error, so the buffer does not hold the
+    /// bytes the caller asked for. Distinct from a short read, which is real
+    /// data that stops at the end of the surface.
+    GlReadFailed,
 };
 
 // ----------------------------------------------------------------------------
@@ -305,6 +441,9 @@ test "an OpenGL backend reports its info" {
     defer backend.deinit();
     const info = backend.info();
     try testing.expect(info.valid);
+    // The surface is what the window's client rect says, which for a hidden
+    // popup is the requested size. Asserted through the backend rather than
+    // hardcoded, so a DPI-scaled runner does not make this a lie.
     try testing.expectEqual(@as(u32, 256), info.width);
     try testing.expectEqual(@as(u32, 256), info.height);
     try testing.expectEqualStrings("", info.last_error);
@@ -332,8 +471,7 @@ test "a read returns the pixels the context was filled with" {
     // read it back through `read`. This is what separates a real glReadPixels
     // from a buffer that merely stayed undefined: the all-zero test above
     // cannot tell those apart, because a cleared-to-black framebuffer and a
-    // never-written buffer are both zero. If `read` were a no-op, the
-    // channels below would be whatever `undefined` happened to hold.
+    // never-written buffer are both zero.
     ogl.glClearColor(0.25, 0.5, 0.75, 1.0);
     ogl.glClear(ogl.GL_COLOR_BUFFER_BIT);
 
@@ -353,14 +491,64 @@ test "a read returns the pixels the context was filled with" {
     try testing.expect(buf[0] != buf[1] and buf[1] != buf[2]);
 }
 
+test "a read that crosses a row boundary keeps pixels in linear order" {
+    var backend = try Backend.init(testing.allocator);
+    defer backend.deinit();
+    const w = backend.width;
+
+    // Paint exactly one pixel of the second row green and leave the rest black,
+    // using a one-pixel scissor box. That single pixel is what a rectangle read
+    // gets wrong: reading at the last column of row 0 must continue to column 0
+    // of row 1, not down column w-1.
+    ogl.glClearColor(0.0, 0.0, 0.0, 1.0);
+    ogl.glClear(ogl.GL_COLOR_BUFFER_BIT);
+    ogl.glEnable(ogl.GL_SCISSOR_TEST);
+    ogl.glScissor(0, 1, 1, 1);
+    ogl.glClearColor(0.0, 1.0, 0.0, 1.0);
+    ogl.glClear(ogl.GL_COLOR_BUFFER_BIT);
+    ogl.glDisable(ogl.GL_SCISSOR_TEST);
+    ogl.glScissor(0, 0, @intCast(w), @intCast(backend.height));
+
+    // Start at the last pixel of row 0 and read two pixels. The second must be
+    // the green pixel at column 0 of row 1; a rectangle read would return
+    // column w-1 of row 1, which is black.
+    var buf: [8]u8 = undefined;
+    const n = try backend.read((@as(u64, w) - 1) * 4, &buf);
+    try testing.expectEqual(@as(usize, 8), n);
+    // First pixel: the black last pixel of row 0.
+    try testing.expectEqual(@as(u8, 0), buf[0]);
+    try testing.expectEqual(@as(u8, 0), buf[1]);
+    try testing.expectEqual(@as(u8, 0), buf[2]);
+    try testing.expectEqual(@as(u8, 255), buf[3]);
+    // Second pixel: the green pixel at the start of row 1.
+    try testing.expectEqual(@as(u8, 0), buf[4]);
+    try testing.expectEqual(@as(u8, 255), buf[5]);
+    try testing.expectEqual(@as(u8, 0), buf[6]);
+    try testing.expectEqual(@as(u8, 255), buf[7]);
+}
+
+test "an offset at or past the end of the surface returns zero" {
+    var backend = try Backend.init(testing.allocator);
+    defer backend.deinit();
+
+    const surface_bytes = @as(u64, backend.width) * @as(u64, backend.height) * 4;
+    var buf: [8]u8 = undefined;
+    // Exactly the end: nothing to read.
+    try testing.expectEqual(@as(usize, 0), try backend.read(surface_bytes, &buf));
+    // Well past the end, where the old row arithmetic underflowed `height - py`
+    // and trapped in a safety-checked build.
+    try testing.expectEqual(@as(usize, 0), try backend.read(surface_bytes + 65536, &buf));
+}
+
 test "reading past the framebuffer edge returns a short count" {
     var backend = try Backend.init(testing.allocator);
     defer backend.deinit();
 
-    // 256x256 RGBA framebuffer = 262144 bytes. Reading at offset 262140
-    // should return 4 bytes, not crash.
+    // On a 256x256 surface, byte 262140 is the last pixel, so a two-pixel read
+    // must stop after one.
+    const last_px_byte = (@as(u64, backend.width) * @as(u64, backend.height) - 1) * 4;
     var buf: [8]u8 = undefined;
-    const n = try backend.read(262140, &buf);
+    const n = try backend.read(last_px_byte, &buf);
     try testing.expectEqual(@as(usize, 4), n);
 }
 
@@ -369,7 +557,8 @@ test "a 4 KiB aligned buffer reads correctly" {
     defer backend.deinit();
 
     var buf: [4096]u8 = undefined;
-    // 4 KiB = 1024 pixels. On a 256-wide framebuffer that is 4 rows.
+    // 4 KiB = 1024 pixels. On a 256-wide framebuffer that is 4 rows, which is
+    // the fast path: one rectangle, not four row reads.
     const n = try backend.read(0, &buf);
     try testing.expectEqual(@as(usize, 4096), n);
     for (&buf) |byte| {
@@ -386,6 +575,17 @@ test "reading from an unaligned buffer is refused" {
     try testing.expectError(Error.GlNotAligned, result);
 }
 
+test "two backends can exist in the same process" {
+    // The window class is process-global, so the second backend finds the name
+    // already registered. That used to be fatal; it must not be.
+    var first = try Backend.init(testing.allocator);
+    defer first.deinit();
+    var second = try Backend.init(testing.allocator);
+    defer second.deinit();
+    try testing.expect(first.valid());
+    try testing.expect(second.valid());
+}
+
 test "an OpenGL backend survives destruction and recreation" {
     var backend = try Backend.init(testing.allocator);
     defer backend.deinit();
@@ -394,7 +594,8 @@ test "an OpenGL backend survives destruction and recreation" {
     backend.deinit();
     try testing.expect(!backend.valid());
 
-    // Re-create on the same allocator.
+    // Re-create on the same allocator. `deinit` is idempotent, so the deferred
+    // call above is a no-op rather than a second window-class release.
     backend = try Backend.init(testing.allocator);
     defer backend.deinit();
     try testing.expect(backend.valid());

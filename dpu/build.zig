@@ -145,15 +145,17 @@ pub fn build(b: *std.Build) void {
     // ---------------------------------------------------------------- OpenGL backend
     //
     // A WGL-based read backend for the residency fault path, used when a real
-    // GPU is present and the fault path wants to read a granule from the
-    // framebuffer rather than from the disk pool. It is a drop-in for any
-    // call site that talks to `blockdev.BlockDevice`, because both expose
+    // GPU is present and the fault path wants to read a granule from a surface
+    // rather than from the disk pool. It is a drop-in for any call site that
+    // talks to `blockdev.BlockDevice`, because both expose
     // `read(self: *Backend, offset: u64, buf: []u8)`.
     //
     // This is *not* a replacement for the Vulkan ICD. The ICD owns a
-    // device-local heap backed by the disk pool; this backend reads from the
-    // framebuffer of the host's existing GL context. They are different devices
-    // for different purposes, and the fault path can be backed by either.
+    // device-local heap backed by the disk pool; this backend creates its own
+    // hidden window and WGL context and reads *that* framebuffer, which it
+    // clears to black on creation. It does not read another application's GL
+    // context. They are different devices for different purposes, and the
+    // fault path can be backed by either.
     const gl_mod = b.createModule(.{
         .root_source_file = b.path("src/backend/gl.zig"),
         .target = target,
