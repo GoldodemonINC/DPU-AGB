@@ -34,20 +34,18 @@ is worse than no number.
 | `08d78e5` | #8 | Union of #5 + #6 + #7, and `serveOnce` split into a pure router |
 | `de4be68` | #9 | Split the wire suite into a harness and a contract |
 | `d2ba409` | #10 | Split server.zig by what changes together, and move its tests out |
+| `d8e9b03` | #11 | Assert the telemetry buffer's sixteen fields with a pool of the test's own |
+| `14700fe` | #12 | Make a fresh Windows clone able to pass the gate |
+| `71a3455` | #13 | Measure route 1: serving llama.cpp's weights from the DPU pool |
+| `5232655` | #16 | Revert the wrong ABI fix, land residency on top, and stop the pool leaking disk |
 
-Every one of #5 to #10 is still open and none is merged. The stack is linear:
+#14 and #15 were closed without merging; #16 replaced both, based directly on
+`main` with no stacked dependency. **#17 is the only open PR**, carrying the root
+README and the corrections to `dpu/README.md`.
 
-- **#5** `fix/check-must-build-the-exe` — the gate now builds the executable.
-- **#6** `fix/malformed-request-400` — 400 for a request line that is not one.
-- **#7** `fix/head-response-no-body` — no body on a HEAD response.
-- **#8** `integrate/gate-400-and-head` — the union of those three, plus the
-  router split that #9 and #10 both sit on.
-- **#9** `test/wire-conformance` — the wire-level suite.
-- **#10** `refactor/split-server` — the production server, split the same way.
-
-This branch is stacked on all three of #8, #9 and #10 and cannot merge before
-any of them. What it adds is small: a scratch pool for the wire suite, and the
-one assertion that pool makes possible.
+**Every one of #5 to #10 is now merged**, along with #11, #12 and #13. The linear
+stack they were blocked on resolved in the order it was predicted to: #8, then
+#9, then #10, then #11, #12, #13.
 
 PR #1 merged at 2026-10-03T18:06:35Z by the `Goldodemon-Automation` credential
 while a task was mid-run on another branch; PR #2 was merged immediately when
@@ -55,6 +53,21 @@ while a task was mid-run on another branch; PR #2 was merged immediately when
 auto-merge" enabled, so the API's `auto_merge` flag is ignored and the endpoint
 merges on the spot. Both were unrequested and are treated as settled history.
 Squash commits read as human commits; `merged_by` is the automation account.
+
+**PR #16 is the third occurrence, and the first one with a cost.** It merged at
+2026-10-06T03:39:54Z by the same credential, unrequested, capturing only up to
+`804db43` -- the two documentation commits pushed to that branch minutes earlier
+were **not** in it, because the merge ran against the head as it stood before
+those pushes. The push itself had already reported success.
+
+The lesson is narrow and has nothing to do with merges: **a successful push is
+not proof that your work landed.** What settled it was
+`git merge-base --is-ancestor <sha> origin/main` plus `git cat-file -e
+origin/main:README.md`, after re-fetching `main`. Checking where your commits
+*are*, rather than whether a command exited 0, is the check that would have
+caught this immediately. The documentation work was re-based onto `main` at
+`5232655` and reopened as **#17**; the gate was re-run on that new base rather
+than assumed from the pre-merge tree.
 
 ## The HTTP surface
 
@@ -1018,3 +1031,83 @@ is unchanged between the two branches — the already-corrupted bytes survive th
 switch. The attribute has to be present at the initial checkout, or the test is
 measuring the old checkout. Re-checking out with `rm -rf` and `git checkout --`
 reproduces the good state, which is what makes the failing case look fixed.
+## The documentation was stale in the direction that flatters you
+
+The repository had **no README at all**, and the one under `dpu/` was 197 lines
+of which a material fraction was false. Writing the root one meant checking
+every claim against the code instead of against the previous README, and three
+of them did not survive that:
+
+- **`zig build test` was documented as "33 backend tests".** It is **133**
+  (64 backend + 20 tiers + 29 residency + 20 ICD), and `test-vkabi` is 7, for
+  the 140 `check` reports. The gap was not carelessness about a number; it was
+  two named-module test roots whose tests Zig stopped discovering, thirteen at
+  a time, with nothing going red.
+- **"The ICD is an identity, not an executor... no buffers, no `vkAllocateMemory`,
+  no submits."** Flatly false. `entryLookup` carries **74** entry points across
+  an execution layer of 37 implementations, including every command named
+  there. The error was the interesting kind: it understated the driver, which
+  made the work look further from done than it was, and it had survived because
+  nobody diffed the prose against the table.
+- **The latency paragraph contradicted itself inside four lines** -- `~62-66 µs`
+  and `2370 us` for the same measurement -- because it divided a measured device
+  figure by a hardcoded `0.08 µs`. The corrected figure is **57.6 µs** against
+  **0.100-0.185 µs** for RAM, both measured.
+
+The `AllocationSize` bullet looked like a candidate for deletion and is not
+stale: `blockdev.zig`, `pool.zig` and `bench.zig` all still carry that exact
+finding verbatim. A claim does not go stale because the code moved on; it goes
+stale when the code changes its mind. Checking before deleting is the whole
+lesson, and three claims in six is not a bad rate for prose that nobody had
+re-run since it was written.
+
+So the root `README.md` is built to be checkable rather than persuasive. Every
+count in it is a command's output, every table is a measurement, and the
+9B-at-64k verdict is labelled as a planner prediction over measured device
+constants -- because the 9B has still never been run end to end. The one
+sentence that took the longest to write was the one saying so.
+
+## A table with a moving precondition goes stale silently
+
+The final audit of the README work caught one more, and it is a different species
+from the three above. The tier table in both READMEs read:
+
+| Mode | requested | granted | tier.cfg | ICD heap |
+| --- | --- | --- | --- | --- |
+| MAX | 24 GiB | 16 GiB (clamped) | 16 GiB | 16.00 GiB |
+| LOW | 4 GiB | 4 GiB | 4 GiB | 4.00 GiB |
+| xHIGH | 8 GiB | 8 GiB | 8 GiB | 8.00 GiB |
+
+Every row was **true when it was measured** and **false now**. `P:` free space is
+8.11 GiB, not the 18+ GiB the MAX and xHIGH rows require. The table was not
+wrong; it was missing a column, and the column it was missing is the one that
+moves every time the benchmark sweeps a working set through the pool. Nothing
+about the table can be checked without going and standing on the volume.
+
+`resolve()` makes this explicit. It is
+
+```zig
+const cap = @min(requested, budget);
+const granted = tierAtOrBelow(cap);
+```
+
+and `tierAtOrBelow` scans `LADDER_GIB` in full, so a mode's band never filters
+the result -- a mode is an upper bound, and MAX with room for 6 GiB grants 6 GiB.
+Both READMEs now carry the `requires free >=` column and the current resolution.
+
+**And then the audit's own correction.** I wrote "at 8.11 GiB free, MAX is
+`starved`" into both files before re-reading `resolve()`, because I had modelled
+the band restriction that the code no longer implements. At 6.11 GiB of headroom
+`tierAtOrBelow` returns 6 GiB, so MAX is **6 GiB, clamped** -- not starved. The
+first draft of a correction to a correction is exactly where a stale number gets
+reintroduced, and nothing but re-reading the function caught it.
+
+The same stale band language was sitting in a doc comment in `tiers.zig`:
+`granted` was documented as "Zero when nothing in the band fits" and `starved` as
+"no volume has room for even the mode's lowest tier". Both describe the pre-fix
+behaviour. Fixed in the comments; no behaviour changed, and the gate is still
+17/17 and 140/140.
+
+The generalisable rule: a documented measurement needs its **preconditions
+printed next to it**, or it is a claim about a moment rather than a fact. "16 GiB
+clamped" is not a fact about MAX. "16 GiB clamped given at least 18 GiB free" is.
