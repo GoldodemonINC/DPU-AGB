@@ -30,7 +30,10 @@
 //! - It is not thread-safe. WGL contexts are thread-affine and the backend holds
 //!   a single context for its lifetime. Two backends in two threads each get
 //!   their own context (see `class_mutex` for why that works at all); one backend
-//!   used from two threads is undefined.
+//!   used from two threads is undefined. Within one thread, WGL keeps a single
+//!   current context that every backend on that thread shares, so a backend
+//!   tearing itself down must leave that membership alone when it is not the
+//!   one current -- see the ownership invariant on `Backend.ctx`.
 
 const std = @import("std");
 const win = @import("win");
@@ -147,6 +150,15 @@ fn releaseWindowClass() void {
 /// that owns it.
 pub const Backend = struct {
     allocator: std.mem.Allocator,
+    /// This backend's device context and GL context, owned for its lifetime.
+    ///
+    /// Ownership invariant: WGL keeps at most one *current* context per thread,
+    /// shared by every backend on that thread, so a non-null `ctx` does not mean
+    /// `ctx` is current. Only two places may act on that membership -- `read`
+    /// checks it before trusting the surface, and `destroyContext` may clear it
+    /// only when it is *this* backend's context. Do not unmake the thread's
+    /// current context from anywhere else: `wglMakeCurrent(dc, null)` releases
+    /// whichever backend is bound, not necessarily this one.
     dc: ?c.HDC = null,
     ctx: ?c.HGLRC = null,
     hwnd: ?c.HWND = null,
@@ -415,10 +427,18 @@ pub const Backend = struct {
     /// Release the context, DC and window this backend owns. Idempotent, and
     /// safe to call on a partially initialised backend. It does *not* touch the
     /// window class, which is shared and outlives any one backend.
+    ///
+    /// This is the only place allowed to unmake the thread's current context,
+    /// and it does so only when that context is this backend's own -- see the
+    /// ownership invariant on `ctx`. `wglMakeCurrent(dc, null)` clears whatever
+    /// context is current on this thread, so an unconditional call here would
+    /// silently break a live sibling that is the current one.
     fn destroyContext(self: *Backend) void {
         if (self.ctx) |ctx| {
             if (self.dc) |dc| {
-                _ = c.wglMakeCurrent(dc, null);
+                if (c.wglGetCurrentContext() == ctx) {
+                    _ = c.wglMakeCurrent(dc, null);
+                }
             }
             _ = c.wglDeleteContext(ctx);
         }
@@ -877,6 +897,24 @@ test "a second backend makes the first context not current" {
     // WGL is thread-affine: creating the second context made it current, so the
     // first must refuse rather than read whichever surface happens to be bound.
     try testing.expectError(Error.GlContextLost, first.read(0, &buf));
+    try testing.expectEqual(@as(usize, 8), try second.read(0, &buf));
+}
+
+test "destroying a backend that is not current leaves a live sibling current" {
+    var first = try Backend.init(testing.allocator);
+    var second = try Backend.init(testing.allocator);
+    defer second.deinit();
+
+    var buf: [8]u8 = undefined;
+    // `second` was the last one initialised, so it is the context current on
+    // this thread.
+    try testing.expectEqual(@as(usize, 8), try second.read(0, &buf));
+
+    // WGL keeps one current context per thread, shared by every backend on it.
+    // Destroying `first` must not clear that membership: `wglMakeCurrent(dc,
+    // null)` releases the *thread's* current context whoever it belongs to, so
+    // doing it unconditionally here silently breaks the survivor.
+    first.deinit();
     try testing.expectEqual(@as(usize, 8), try second.read(0, &buf));
 }
 

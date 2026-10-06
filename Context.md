@@ -11,7 +11,7 @@ so a green run means both shipped binaries compile. The eleven tests the granule
 fault path added are unchanged; the one this branch adds is the OpenGL backend's
 contract pin, which is a compile-time assertion and so needs no display.
 
-`zig build gl-test` — **23/23 tests**, exit 0, and it is deliberately *not* in
+`zig build gl-test` — **24/24 tests**, exit 0, and it is deliberately *not* in
 `check`. It creates a real WGL context, so it needs a live WindowStation and
 hangs rather than fails without one -- the same reason the Vulkan probe is not in
 the gate. On this machine it passes; the GL backend's section below has the
@@ -1080,6 +1080,53 @@ baseline -- but it passes on the atomic version too, so it is a lifecycle guard,
 not the proof: the race window is a few instructions wide and the pass could not
 force it even at 1600 context cycles. The guarantee is mutual exclusion; the
 stress test only shows the concurrent path is exercised and balanced.
+
+### A destroyed backend must not unmake a live sibling's context
+
+An audit over the real GL surface found one more defect in the same shape as the
+read bugs: behaviour that is fine with one backend and wrong with two. WGL keeps
+at most one *current* context per thread, shared by every backend on that thread,
+so a backend's context being non-null does not mean it is the current one.
+`destroyContext` called `wglMakeCurrent(dc, null)` unconditionally, and that call
+releases whichever context is current on the thread -- so the ordinary sequence
+create `a`, create `b` (now current), `a.deinit()` left `b.read` returning
+`GlContextLost` even though `b` was alive and untouched. The survivor of a
+teardown silently lost its context membership.
+
+The fix is one guard: `destroyContext` clears the thread's current context only
+when `wglGetCurrentContext()` is this backend's own. The invariant is stated on
+`Backend.ctx` -- the field that owns the context -- and repeated at the one place
+allowed to unmake membership, so a later change cannot reintroduce it without
+contradicting the comment it edits. It is the second of only two places that may
+act on the membership; the other is `read`, which checks it before trusting the
+surface.
+
+The regression test is falsifiable and was checked that way: against the
+unfixed `destroyContext` it fails with `error.GlContextLost` at the surviving
+`b.read`, and after the guard it passes. `gl-test` is 24 tests.
+
+### Acknowledged open items from the audit
+
+An audit of this branch (not acted on here, recorded so they are not rediscovered)
+raised these, in descending value:
+
+- The PR is stacked on `feat/granule-fault-path`, so no diff is reviewable
+  against `main` and `check` on plain `main` is red until #18 lands. Retarget
+  when it merges.
+- Nothing routes a granule read through the backend, so the claim that one
+  `glReadPixels` per granule beats the pool has no measured number.
+- `resize`, `Info`/`info()`, `valid()`, `last_error` and `pub const Error` have no
+  consumer outside `gl.zig`; the only client, `residency.Faults`, uses
+  `read`/`init`/`deinit`. They are additive surface, not required by the
+  backend's job.
+- The registry race's regression test asserts an implementation detail (that no
+  `RegisterClassExA` is attempted) and the two-thread stress test passes on the
+  unfixed atomic code, so a *different* racy reimplementation would slip past
+  both.
+- A failed `resize` leaves the new `width`/`height` in place with `ctx == null`,
+  so `info()` reports a surface that does not exist; untested.
+- `gl.zig` carries the registry, the context lifecycle, the read and every test
+  in one file; the repo already splits test modules elsewhere.
 
 ### The MinGW translate-c workarounds, itemised
 
