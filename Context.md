@@ -5,11 +5,12 @@ applications as a discrete GPU through a user-mode installable client driver.
 
 ## Status at this commit
 
-`zig build check` — **138/138 tests**, exit 0, `zig fmt --check` clean. The gate
-also builds `dpu.exe`, so a green run now means the shipping binary compiles.
+`zig build check` — **140/140 tests**, exit 0, `zig fmt --check` clean. The gate
+also builds `dpu.exe` and `dpubench`, so a green run means both shipped
+binaries compile.
 
-`zig build probe` — **55/55, exit 0**, closing with
-`PROBE_SUMMARY: total=55 passed=55 failed=0 result=PASS` and
+`zig build probe` — **61/61, exit 0**, closing with
+`PROBE_SUMMARY: total=61 passed=61 failed=0 result=PASS` and
 `RESULT: PASS -- the DPU heap carries real bytes on disk`, and with **no loader
 warnings at all** under `VK_LOADER_DEBUG=error,warn`.
 
