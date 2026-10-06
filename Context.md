@@ -34,20 +34,18 @@ is worse than no number.
 | `08d78e5` | #8 | Union of #5 + #6 + #7, and `serveOnce` split into a pure router |
 | `de4be68` | #9 | Split the wire suite into a harness and a contract |
 | `d2ba409` | #10 | Split server.zig by what changes together, and move its tests out |
+| `d8e9b03` | #11 | Assert the telemetry buffer's sixteen fields with a pool of the test's own |
+| `14700fe` | #12 | Make a fresh Windows clone able to pass the gate |
+| `71a3455` | #13 | Measure route 1: serving llama.cpp's weights from the DPU pool |
+| `5232655` | #16 | Revert the wrong ABI fix, land residency on top, and stop the pool leaking disk |
 
-Every one of #5 to #10 is still open and none is merged. The stack is linear:
+#14 and #15 were closed without merging; #16 replaced both, based directly on
+`main` with no stacked dependency. **#17 is the only open PR**, carrying the root
+README and the corrections to `dpu/README.md`.
 
-- **#5** `fix/check-must-build-the-exe` — the gate now builds the executable.
-- **#6** `fix/malformed-request-400` — 400 for a request line that is not one.
-- **#7** `fix/head-response-no-body` — no body on a HEAD response.
-- **#8** `integrate/gate-400-and-head` — the union of those three, plus the
-  router split that #9 and #10 both sit on.
-- **#9** `test/wire-conformance` — the wire-level suite.
-- **#10** `refactor/split-server` — the production server, split the same way.
-
-This branch is stacked on all three of #8, #9 and #10 and cannot merge before
-any of them. What it adds is small: a scratch pool for the wire suite, and the
-one assertion that pool makes possible.
+**Every one of #5 to #10 is now merged**, along with #11, #12 and #13. The linear
+stack they were blocked on resolved in the order it was predicted to: #8, then
+#9, then #10, then #11, #12, #13.
 
 PR #1 merged at 2026-10-03T18:06:35Z by the `Goldodemon-Automation` credential
 while a task was mid-run on another branch; PR #2 was merged immediately when
@@ -55,6 +53,21 @@ while a task was mid-run on another branch; PR #2 was merged immediately when
 auto-merge" enabled, so the API's `auto_merge` flag is ignored and the endpoint
 merges on the spot. Both were unrequested and are treated as settled history.
 Squash commits read as human commits; `merged_by` is the automation account.
+
+**PR #16 is the third occurrence, and the first one with a cost.** It merged at
+2026-10-06T03:39:54Z by the same credential, unrequested, capturing only up to
+`804db43` -- the two documentation commits pushed to that branch minutes earlier
+were **not** in it, because the merge ran against the head as it stood before
+those pushes. The push itself had already reported success.
+
+The lesson is narrow and has nothing to do with merges: **a successful push is
+not proof that your work landed.** What settled it was
+`git merge-base --is-ancestor <sha> origin/main` plus `git cat-file -e
+origin/main:README.md`, after re-fetching `main`. Checking where your commits
+*are*, rather than whether a command exited 0, is the check that would have
+caught this immediately. The documentation work was re-based onto `main` at
+`5232655` and reopened as **#17**; the gate was re-run on that new base rather
+than assumed from the pre-merge tree.
 
 ## The HTTP surface
 
