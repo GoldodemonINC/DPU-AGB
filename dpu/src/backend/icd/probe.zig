@@ -209,7 +209,15 @@ pub fn main() !void {
     const pfn_enum: *const fn (?*anyopaque, ?*u32, ?[*]?*anyopaque) callconv(.c) c_int =
         @ptrCast(@alignCast(resolveProcAt("vkEnumeratePhysicalDevices", vk) orelse return finish()));
     _ = pfn_enum(vk, &n, null);
-    check(n >= 2, "loader reports {d} physical devices (iGPU + DPU)", .{n});
+    // Enumeration has to return something before the loop below can look for
+    // the DPU inside it. It deliberately does *not* require a second device:
+    // this probe tests the DPU, and how many other ICDs the host happens to
+    // have installed is none of its business. Asserting `n >= 2` made the gate
+    // quietly depend on someone else's Intel iGPU driver being present, so it
+    // exited 1 whenever the DPU was the only ICD -- and would do the same on
+    // every AMD or NVIDIA box, and on any CI runner. Whether the DPU itself is
+    // there is decided below, by vendor and device ID.
+    check(n >= 1, "loader enumerates {d} physical device(s)", .{n});
 
     var devices: [8]?*anyopaque = undefined;
     if (n > devices.len) n = devices.len;
@@ -299,6 +307,31 @@ pub fn main() !void {
     var queue: c.VkQueue = null;
     pfn_getqueue(device, 0, 0, &queue);
     check(queue != null, "vkGetDeviceQueue returned a queue", .{});
+
+    // The loader itself has to route every entry point this probe depends on.
+    //
+    // `devProc` prefers `vkGetDeviceProcAddr` and falls back to the DPU's own
+    // table when the loader declines. That fallback is what let `vkCmdCopyBuffer`
+    // keep a reversed pointer/count pair for so long: the probe's own
+    // declaration was wrong in the same direction, so probe and ICD agreed by
+    // construction and 100+ green tests proved nothing about the ABI.
+    //
+    // These four are the ones a wrong signature corrupts silently rather than
+    // crashing: submit, the copy, the fill, and the wait.
+    const must_route = [_][:0]const u8{
+        "vkQueueSubmit",
+        "vkCmdCopyBuffer",
+        "vkCmdFillBuffer",
+        "vkWaitForFences",
+    };
+    var unrouted: usize = 0;
+    for (must_route) |name| {
+        if (vkGetDeviceProcAddrPtr.?(device, name.ptr) == null) {
+            std.debug.print("       not routed by the loader: {s}\n", .{name});
+            unrouted += 1;
+        }
+    }
+    check(unrouted == 0, "the loader routes the entry points this probe depends on ({d} unrouted)", .{unrouted});
 
     // ------------------------------------------- 4. allocate on the DPU heap
     std.debug.print("\n4. allocation on the DPU heap\n", .{});
@@ -459,10 +492,43 @@ pub fn main() !void {
     const elapsed_ms = tickMs() - start;
     check(sub == 0, "vkQueueSubmit -> success ({d}), {d} ms", .{ sub, elapsed_ms });
 
-    const pfn_wait: *const fn (c.VkDevice, ?[*]const c.VkFence, c.VkBool32, u64) callconv(.c) c_int =
+    // Five arguments, per the registry: device, fenceCount, pFences, waitAll,
+    // timeout. This was declared with four and called without a count, so the
+    // fence pointer arrived where the count was expected.
+    const pfn_wait: *const fn (c.VkDevice, u32, ?[*]const c.VkFence, c.VkBool32, u64) callconv(.c) c_int =
         @ptrCast(@alignCast(devProc("vkWaitForFences", device, dpu_dev) orelse return finish()));
-    const wrc = pfn_wait(device, @ptrCast(&fence), 0, 10_000_000_000);
+    const wrc = pfn_wait(device, 1, @ptrCast(&fence), 0, 10_000_000_000);
     check(wrc == 0, "vkWaitForFences -> success ({d})", .{wrc});
+
+    // `vkWaitForFences` in this driver always reports success, so the call
+    // above cannot fail and on its own proves nothing. The fence's actual
+    // state can: this is the assertion that fails if a submission never ran.
+    //
+    // The one fence is reused for every later submission here, and the spec
+    // requires it to be unsignaled when it goes back to `vkQueueSubmit`
+    // (VUID-vkQueueSubmit-fence-00063). Without the reset below the driver
+    // cannot tell "signalled by this submission" from "still signalled from the
+    // last one", so the status check would be reading its own previous answer.
+    const pfn_status: *const fn (c.VkDevice, c.VkFence) callconv(.c) c_int =
+        @ptrCast(@alignCast(devProc("vkGetFenceStatus", device, dpu_dev) orelse return finish()));
+    // `VkResult`, not `void`: `PFN_vkResetFences` returns one, and the probe
+    // that claims to check a reset can only do so if the status exists.
+    const pfn_reset: *const fn (c.VkDevice, u32, ?[*]const c.VkFence) callconv(.c) c_int =
+        @ptrCast(@alignCast(devProc("vkResetFences", device, dpu_dev) orelse return finish()));
+
+    // The driver creates fences already signalled. Left that way, the first
+    // status read below would return VK_SUCCESS whether or not the submission
+    // ran, which is the exact failure this check exists to catch. Reset first,
+    // confirm it is unsignalled, then let the submission raise it.
+    const reset_rc = pfn_reset(device, 1, @ptrCast(&fence));
+    check(reset_rc == 0, "vkResetFences -> success ({d})", .{reset_rc});
+    const pre_status = pfn_status(device, fence);
+    check(pre_status == c.VK_NOT_READY, "fence is unsignalled before submitting ({d})", .{pre_status});
+
+    const sub2 = pfn_submit(queue, 1, &si, fence);
+    check(sub2 == 0, "vkQueueSubmit (after reset) -> success ({d})", .{sub2});
+    const first_status = pfn_status(device, fence);
+    check(first_status == c.VK_SUCCESS, "fence is signalled after the submit ({d})", .{first_status});
 
     // ----------------------------------------- 6. verify against the disk
     std.debug.print("\n6. verify the bytes are on the disk\n", .{});
@@ -513,13 +579,19 @@ pub fn main() !void {
     std.debug.print("\n7. read back through the driver\n", .{});
     check(pfn_begin(cmd, &cbbi) == 0, "vkBeginCommandBuffer (round 2)", .{});
 
-    const pfn_copy: *const fn (c.VkCommandBuffer, c.VkBuffer, c.VkBuffer, ?*const c.VkBufferCopy, u32) callconv(.c) void =
+    // The count precedes the array, per the registry. The probe previously
+    // declared its own pointer in the opposite order, which is how the ICD got
+    // away with the same mistake: both sides agreed by construction.
+    const pfn_copy: *const fn (c.VkCommandBuffer, c.VkBuffer, c.VkBuffer, u32, ?*const c.VkBufferCopy) callconv(.c) void =
         @ptrCast(@alignCast(devProc("vkCmdCopyBuffer", device, dpu_dev) orelse return finish()));
     var region: c.VkBufferCopy = .{ .srcOffset = 0, .dstOffset = 0, .size = PAYLOAD };
-    pfn_copy(cmd, dev_buf, vbuf, &region, 1);
+    pfn_copy(cmd, dev_buf, vbuf, 1, &region);
     _ = pfn_end(cmd);
+    check(pfn_reset(device, 1, @ptrCast(&fence)) == 0, "vkResetFences (copy back) -> success", .{});
     check(pfn_submit(queue, 1, &si, fence) == 0, "vkQueueSubmit (copy back) -> success", .{});
-    _ = pfn_wait(device, @ptrCast(&fence), 0, 10_000_000_000);
+    _ = pfn_wait(device, 1, @ptrCast(&fence), 0, 10_000_000_000);
+    const copy_back_status = pfn_status(device, fence);
+    check(copy_back_status == c.VK_SUCCESS, "fence signalled after the copy back ({d})", .{copy_back_status});
 
     var round_trip_bad: usize = 0;
     for (0..check_bytes / 4) |k| {
@@ -543,17 +615,23 @@ pub fn main() !void {
     check(pfn_begin(cmd, &cbbi) == 0, "vkBeginCommandBuffer (fill)", .{});
     pfn_fill(cmd, dev_buf, 0, PAYLOAD, FILL);
     _ = pfn_end(cmd);
+    check(pfn_reset(device, 1, @ptrCast(&fence)) == 0, "vkResetFences (fill) -> success", .{});
     check(pfn_submit(queue, 1, &si, fence) == 0, "vkQueueSubmit (fill) -> success", .{});
-    _ = pfn_wait(device, @ptrCast(&fence), 0, 10_000_000_000);
+    _ = pfn_wait(device, 1, @ptrCast(&fence), 0, 10_000_000_000);
+    const fill_status = pfn_status(device, fence);
+    check(fill_status == c.VK_SUCCESS, "fence signalled after the fill ({d})", .{fill_status});
 
     // Read it back through the driver rather than trusting the submit status,
     // which is the whole lesson of this file: a path that writes nothing still
     // returns VK_SUCCESS.
     check(pfn_begin(cmd, &cbbi) == 0, "vkBeginCommandBuffer (fill readback)", .{});
-    pfn_copy(cmd, dev_buf, vbuf, &region, 1);
+    pfn_copy(cmd, dev_buf, vbuf, 1, &region);
     _ = pfn_end(cmd);
+    check(pfn_reset(device, 1, @ptrCast(&fence)) == 0, "vkResetFences (fill readback) -> success", .{});
     check(pfn_submit(queue, 1, &si, fence) == 0, "vkQueueSubmit (fill readback) -> success", .{});
-    _ = pfn_wait(device, @ptrCast(&fence), 0, 10_000_000_000);
+    _ = pfn_wait(device, 1, @ptrCast(&fence), 0, 10_000_000_000);
+    const readback_status = pfn_status(device, fence);
+    check(readback_status == c.VK_SUCCESS, "fence signalled after the fill readback ({d})", .{readback_status});
 
     var fill_bad: usize = 0;
     for (0..check_bytes / 4) |k| {

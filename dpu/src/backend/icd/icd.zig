@@ -45,7 +45,20 @@ const DPU_DRIVER_VERSION: u32 = 1;
 /// map a DXGI adapter LUID onto a physical device; since the DPU is not a DXGI
 /// adapter there is nothing for it to map, and capping at 4 keeps the loader on
 /// the path that enumerates every ICD's devices unconditionally.
-const ICD_INTERFACE_VERSION: u32 = 4;
+/// Loader ICD interface version.
+///
+/// 5, not 4, and the reason is observable rather than aspirational. With the
+/// entry point `vkEnumerateInstanceVersion` added, the loader stopped logging
+/// `treating as a 1.0 ICD` and started logging this instead:
+///
+///     Driver dpu_icd.dll supports Vulkan 1.3, but only supports loader
+///     interface version 4. Interface version 5 or newer required to support
+///     this version of Vulkan (Policy #LDP_DRIVER_7)
+///
+/// Reporting 1.3 while holding interface 4 is worse than reporting 1.0: the
+/// manifest and `VkPhysicalDeviceProperties::apiVersion` both say 1.3, and the
+/// loader now believes them. Interface 5 is what makes that belief correct.
+const ICD_INTERFACE_VERSION: u32 = 5;
 
 /// Instance and physical device handles are dispatchable, which on 64-bit
 /// means they are opaque pointers. Pointing them at our own singletons is both
@@ -198,6 +211,7 @@ fn entryLookup(name: []const u8) ?Pfn {
         .{ "vkCreateInstance", &vkCreateInstanceImpl },
         .{ "vkEnumerateInstanceExtensionProperties", &vkEnumerateInstanceExtensionPropertiesImpl },
         .{ "vkEnumerateInstanceLayerProperties", &vkEnumerateInstanceLayerPropertiesImpl },
+        .{ "vkEnumerateInstanceVersion", &vkEnumerateInstanceVersionImpl },
         .{ "vkEnumeratePhysicalDevices", &vkEnumeratePhysicalDevicesImpl },
         .{ "vkEnumeratePhysicalDeviceGroups", &vkEnumeratePhysicalDeviceGroupsImpl },
         .{ "vkEnumeratePhysicalDeviceGroupsKHR", &vkEnumeratePhysicalDeviceGroupsImpl },
@@ -287,8 +301,65 @@ fn entryLookup(name: []const u8) ?Pfn {
 export fn vk_icdGetPhysicalDeviceProcAddr(_: ?*anyopaque, pName: ?[*:0]const u8) callconv(.c) ?*anyopaque {
     if (pName == null) return null;
     const name = std.mem.span(pName.?);
+
+    // Interface version 5 requires this to return a pointer only for commands
+    // whose first dispatchable argument is a `VkPhysicalDevice`, and null for
+    // everything else -- including commands it does not recognise.
+    //
+    // An allowlist, not a denylist. The earlier version excluded six
+    // instance-scope names and let the rest of the table through, which meant
+    // a non-null answer for `vkEnumeratePhysicalDevices` (whose dispatchable
+    // argument is an instance) and for every device command such as
+    // `vkCmdWriteBuffer`. A non-null answer tells the loader it may build a
+    // physical-device trampoline, and calling a device command through that
+    // trampoline dereferences the wrong handle: it is a crash, not an error.
+    if (!isPhysicalDeviceScope(name)) return null;
+
     const entry = entryLookup(name) orelse return null;
     return @ptrCast(@constCast(entry));
+}
+
+/// The commands this driver routes whose first dispatchable argument is a
+/// `VkPhysicalDevice`.
+///
+/// Everything else -- instance commands, device commands, queue commands --
+/// must come back null from `vk_icdGetPhysicalDeviceProcAddr`.
+fn isPhysicalDeviceScope(name: []const u8) bool {
+    const physical_device_scope = [_][]const u8{
+        "vkGetPhysicalDeviceProcAddr",
+        "vkGetPhysicalDeviceProperties",
+        "vkGetPhysicalDeviceProperties2",
+        "vkGetPhysicalDeviceProperties2KHR",
+        "vkGetPhysicalDeviceFeatures",
+        "vkGetPhysicalDeviceFeatures2",
+        "vkGetPhysicalDeviceFeatures2KHR",
+        "vkGetPhysicalDeviceMemoryProperties",
+        "vkGetPhysicalDeviceMemoryProperties2",
+        "vkGetPhysicalDeviceMemoryProperties2KHR",
+        "vkEnumerateDeviceExtensionProperties",
+        "vkEnumerateDeviceLayerProperties",
+        "vkEnumerateDeviceQueueFamilies",
+        "vkGetPhysicalDeviceQueueFamilyProperties",
+        "vkGetPhysicalDeviceFormatProperties",
+        "vkGetPhysicalDeviceImageFormatProperties",
+        "vkGetPhysicalDeviceImageFormatProperties2",
+        "vkGetPhysicalDeviceSparseImageFormatProperties",
+        "vkGetPhysicalDeviceSparseImageFormatProperties2",
+        "vkGetPhysicalDeviceExternalBufferProperties",
+        "vkGetPhysicalDeviceExternalFenceProperties",
+        "vkGetPhysicalDeviceExternalSemaphoreProperties",
+        "vkGetPhysicalDeviceToolProperties",
+        "vkGetPhysicalDeviceSurfaceSupportKHR",
+        "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+        "vkGetPhysicalDeviceSurfaceFormatsKHR",
+        "vkGetPhysicalDeviceSurfacePresentModesKHR",
+        "vkEnumeratePhysicalDeviceGroups",
+        "vkEnumeratePhysicalDeviceGroupsKHR",
+    };
+    for (physical_device_scope) |s| {
+        if (std.mem.eql(u8, name, s)) return true;
+    }
+    return false;
 }
 
 // --------------------------------------------------------------- instance
@@ -324,6 +395,27 @@ fn vkEnumerateInstanceExtensionPropertiesImpl(
     if (pCount) |n| n.* = 0;
     _ = pProps;
     return 0;
+}
+
+/// The instance API version this driver implements.
+///
+/// `vk_icd.json` declares `"api_version":"1.3"`, and that claim is only
+/// confirmed if the ICD answers this call. Without the entry point the loader
+/// falls back to assuming 1.0 and logs `treating as a 1.0 ICD`, which is the
+/// difference between a driver that says what it is and one that is taken at
+/// its word.
+///
+/// The version returned has to agree with the two other places the driver
+/// states it: `vk_icd.json`'s `"api_version":"1.3"` and
+/// `VkPhysicalDeviceProperties::apiVersion`, which `fillProperties` already
+/// sets to `VK_API_VERSION_1_3`. Answering 1.0 here would not be caution, it
+/// would be a third number that disagrees with the other two -- and the loader
+/// uses the *lower* of the manifest and this answer, so under-reporting here
+/// silently caps a driver that advertises 1.3 everywhere else.
+fn vkEnumerateInstanceVersionImpl(pApiVersion: ?*u32) callconv(.c) c_int {
+    const p = pApiVersion orelse return c.VK_ERROR_INITIALIZATION_FAILED;
+    p.* = c.VK_API_VERSION_1_3;
+    return c.VK_SUCCESS;
 }
 
 fn vkEnumerateInstanceLayerPropertiesImpl(pCount: ?*u32, _: ?[*]c.VkLayerProperties) callconv(.c) c_int {

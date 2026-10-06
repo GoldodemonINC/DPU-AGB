@@ -46,6 +46,17 @@ pub const DEFAULT_CEILING: u64 = 8 * 1024 * 1024 * 1024;
 /// How far the file grows at a time when a write runs past its end.
 const GROW_CHUNK: u64 = 64 * 1024 * 1024;
 
+/// Share mode for every open of the pool file.
+///
+/// `FILE_SHARE_DELETE` is load-bearing, not tidiness. Without it, a peer
+/// process holding the pool open makes `DeleteFileW` fail with
+/// ERROR_SHARING_VIOLATION, so `destroy` unlinks nothing and the pool's
+/// gigabytes stay on the volume while the caller is told it succeeded. With it,
+/// NTFS marks the file delete-pending and reclaims the space as soon as the last
+/// handle closes -- which is the behaviour a scratch pool needs when the engine
+/// and the ICD are both using the same file.
+const SHARE_MODE: u32 = @as(u32, c.FILE_SHARE_READ) | @as(u32, c.FILE_SHARE_WRITE) | @as(u32, c.FILE_SHARE_DELETE);
+
 /// Free space kept in reserve on the volume. The pool must never be the thing
 /// that fills the disk.
 ///
@@ -156,6 +167,12 @@ pub const BlockDevice = struct {
     /// True when the handle really is `NO_BUFFERING | WRITE_THROUGH`. False
     /// means this pool is a cached file and its timings are cache timings.
     uncached: bool = false,
+    /// Whether `destroy` successfully requested the pool file's removal. See
+    /// `poolRemoved` for what true and false each mean: `true` is an accepted
+    /// unlink, which under `FILE_SHARE_DELETE` may be delete-pending until a
+    /// peer closes its handle; `false` is a refused delete, with the pool's
+    /// bytes still on the volume.
+    deleted: bool = false,
     /// Handle for the cross-process pool lock, or null when it could not be
     /// created. This used to mean transfers proceeded unlocked, which is the
     /// race the mutex was added to prevent; `acquire` now refuses instead.
@@ -287,6 +304,25 @@ pub const BlockDevice = struct {
         return self.ceiling;
     }
 
+    /// Whether `destroy` successfully *requested* the pool's removal.
+    ///
+    /// Not the same as "the space is back". With `FILE_SHARE_DELETE`, the
+    /// delete can succeed while a peer still has the file open; NTFS then marks
+    /// it delete-pending and reclaims the bytes only when that last handle
+    /// closes. So `true` means the unlink was accepted, and a caller that needs
+    /// to know whether the volume has its space back yet has to ask again later
+    /// -- or close the peer.
+    ///
+    /// It does mean something concrete: `false` is a delete that was refused,
+    /// typically because a peer opened the pool *without* `FILE_SHARE_DELETE`,
+    /// in which case the pool's bytes are still on disk right now.
+    ///
+    /// `destroy` cannot return an error -- its callers are in files this module
+    /// does not own -- so the outcome is recorded and read after the fact.
+    pub fn poolRemoved(self: *const BlockDevice) bool {
+        return self.deleted;
+    }
+
     /// Close and delete the pool file, then release the same state `deinit`
     /// does. For scratch pools only — a real pool is destroyed by unlinking
     /// it, and nothing here can undo that.
@@ -303,6 +339,24 @@ pub const BlockDevice = struct {
             // would strand a multi-gigabyte scratch pool on the volume, which is
             // the worse outcome on a path documented as scratch-only.
             //
+            // The delete's *result* used to be discarded, which hid a real leak.
+            // The engine and the ICD are separate processes that both hold the
+            // pool open, and `DeleteFileW` against a file another handle has
+            // open fails with ERROR_SHARING_VIOLATION (os.remove surfaces it
+            // as PermissionError 13). Measured on this volume: a 512 MB sparse
+            // pool, deleted while a second handle was open, left all 546 MB on
+            // disk and the call still "succeeded" here. So the next run opened
+            // the *previous* multi-gigabyte pool instead of a fresh one, and the
+            // volume drifted down by a few GB across benchmark runs with nothing
+            // reporting why.
+            //
+            // Two changes, and both are needed. `FILE_SHARE_DELETE` on the open
+            // makes the delete *succeed* while a peer reads -- NTFS marks the
+            // file delete-pending and reclaims the space when the last handle
+            // closes. Checking the return value means that when it still cannot
+            // be deleted, `destroy` reports that rather than claiming a clean
+            // exit over a full volume.
+            //
             // Scoped so the release runs before the mutex handle itself is
             // closed at the end of this function.
             {
@@ -310,7 +364,7 @@ pub const BlockDevice = struct {
                 defer self.release();
                 _ = c.CloseHandle(self.handle);
                 self.open = false;
-                _ = c.DeleteFileW(self.path.ptr);
+                self.deleted = c.DeleteFileW(self.path.ptr) != 0;
             }
         }
         if (self.lock) |m| _ = c.CloseHandle(m);
@@ -346,7 +400,7 @@ pub const BlockDevice = struct {
         self.handle = c.CreateFileW(
             self.path.ptr,
             c.GENERIC_READ | c.GENERIC_WRITE,
-            c.FILE_SHARE_READ | c.FILE_SHARE_WRITE,
+            SHARE_MODE,
             null,
             c.OPEN_ALWAYS,
             @as(u32, c.FILE_ATTRIBUTE_NORMAL) | UNCACHED,
@@ -358,7 +412,7 @@ pub const BlockDevice = struct {
             self.handle = c.CreateFileW(
                 self.path.ptr,
                 c.GENERIC_READ | c.GENERIC_WRITE,
-                c.FILE_SHARE_READ | c.FILE_SHARE_WRITE,
+                SHARE_MODE,
                 null,
                 c.OPEN_ALWAYS,
                 c.FILE_ATTRIBUTE_NORMAL,
