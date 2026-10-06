@@ -914,6 +914,10 @@ test "read after deinit returns GlContextLost, and deinit is idempotent" {
 
     var buf: [8]u8 = undefined;
     try testing.expectError(Error.GlContextLost, backend.read(0, &buf));
+    // Even a zero-length read: the missing context is checked before the length,
+    // so "nothing to read" is not an answer a contextless backend can give.
+    var empty: [0]u8 = .{};
+    try testing.expectError(Error.GlContextLost, backend.read(0, &empty));
 
     // A second deinit must not underflow the shared window-class count.
     const after_first = classRefCount();

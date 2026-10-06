@@ -1035,8 +1035,11 @@ as the thing its unaligned helpers exist to avoid, so the backend refuses
 instead. The guard was checked by reverting it and watching both cases go red.
 
 The byte count means "bytes actually read": a short count is the surface ending
-inside the request, an aligned offset at or past the end is a clean 0, and a
-zero-length buffer is 0 before anything else is considered. An unaligned base
+inside the request, and an aligned offset at or past the end is a clean 0. A
+zero-length buffer returns 0 before the alignment and context checks -- but only
+once the backend has a context: a released or never-initialised backend returns
+`GlContextLost` for a zero-length read, because the missing context is checked
+first. An unaligned base
 pointer is *not* rejected -- `GL_PACK_ALIGNMENT` governs the stride between rows,
 not the base address -- and a test asserts the bytes are correct from an
 unaligned window rather than only that the count is right.
