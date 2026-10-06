@@ -1053,3 +1053,48 @@ count in it is a command's output, every table is a measurement, and the
 9B-at-64k verdict is labelled as a planner prediction over measured device
 constants -- because the 9B has still never been run end to end. The one
 sentence that took the longest to write was the one saying so.
+
+## A table with a moving precondition goes stale silently
+
+The final audit of the README work caught one more, and it is a different species
+from the three above. The tier table in both READMEs read:
+
+| Mode | requested | granted | tier.cfg | ICD heap |
+| --- | --- | --- | --- | --- |
+| MAX | 24 GiB | 16 GiB (clamped) | 16 GiB | 16.00 GiB |
+| LOW | 4 GiB | 4 GiB | 4 GiB | 4.00 GiB |
+| xHIGH | 8 GiB | 8 GiB | 8 GiB | 8.00 GiB |
+
+Every row was **true when it was measured** and **false now**. `P:` free space is
+8.11 GiB, not the 18+ GiB the MAX and xHIGH rows require. The table was not
+wrong; it was missing a column, and the column it was missing is the one that
+moves every time the benchmark sweeps a working set through the pool. Nothing
+about the table can be checked without going and standing on the volume.
+
+`resolve()` makes this explicit. It is
+
+```zig
+const cap = @min(requested, budget);
+const granted = tierAtOrBelow(cap);
+```
+
+and `tierAtOrBelow` scans `LADDER_GIB` in full, so a mode's band never filters
+the result -- a mode is an upper bound, and MAX with room for 6 GiB grants 6 GiB.
+Both READMEs now carry the `requires free >=` column and the current resolution.
+
+**And then the audit's own correction.** I wrote "at 8.11 GiB free, MAX is
+`starved`" into both files before re-reading `resolve()`, because I had modelled
+the band restriction that the code no longer implements. At 6.11 GiB of headroom
+`tierAtOrBelow` returns 6 GiB, so MAX is **6 GiB, clamped** -- not starved. The
+first draft of a correction to a correction is exactly where a stale number gets
+reintroduced, and nothing but re-reading the function caught it.
+
+The same stale band language was sitting in a doc comment in `tiers.zig`:
+`granted` was documented as "Zero when nothing in the band fits" and `starved` as
+"no volume has room for even the mode's lowest tier". Both describe the pre-fix
+behaviour. Fixed in the comments; no behaviour changed, and the gate is still
+17/17 and 140/140.
+
+The generalisable rule: a documented measurement needs its **preconditions
+printed next to it**, or it is a claim about a moment rather than a fact. "16 GiB
+clamped" is not a fact about MAX. "16 GiB clamped given at least 18 GiB free" is.

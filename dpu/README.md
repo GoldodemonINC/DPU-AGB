@@ -69,9 +69,11 @@ offsets that clients are already holding.
 
 ### On this machine, 24 GiB is refused
 
-`P:\` is a 25.23 GiB volume. With the 2 GiB reserve, 24 GiB does not fit, so MAX
-resolves to 16 GiB with `clamped: true`. That is the ladder working, not a bug.
-On a larger volume MAX grants the full 24 GiB with nothing to clamp.
+`P:\` is a 25.23 GiB volume, so with the 2 GiB reserve the 24 GiB rung can never
+be granted here: the volume cannot hold the pool plus the reserve. That much is
+permanent. **What MAX actually resolves to is not permanent** — it is 16 GiB
+clamped when at least 18 GiB is free, and `starved` below that. On a larger
+volume MAX grants the full 24 GiB with nothing to clamp.
 
 ## The Vulkan ICD
 
@@ -108,13 +110,25 @@ time and sizes its heap from it. If the file is missing or implausible it falls
 back to the bottom rung: an ICD that cannot find the engine's state still has to
 load, but it should not advertise capacity nobody authorised.
 
-Verified end to end — the published tier and the heap a Vulkan client sees:
+Verified end to end — the published tier and the heap a Vulkan client sees.
+Read the last column: **every row is conditional on free space**, and free space
+on `P:` moves each time the benchmark sweeps an 8 GiB working set through the
+pool.
 
-| Mode | requested | granted | tier.cfg | ICD heap |
-|---|---|---|---|---|
-| MAX | 24 GiB | 16 GiB (clamped) | 16 GiB | 16.00 GiB |
-| LOW | 4 GiB | 4 GiB | 4 GiB | 4.00 GiB |
-| xHIGH | 8 GiB | 8 GiB | 8 GiB | 8.00 GiB |
+| Mode | requested | granted | tier.cfg | ICD heap | requires free >= |
+|---|---|---|---|---|---|
+| MAX | 24 GiB | 16 GiB (clamped) | 16 GiB | 16.00 GiB | 18 GiB |
+| LOW | 4 GiB | 4 GiB | 4 GiB | 4.00 GiB | 6 GiB |
+| xHIGH | 8 GiB | 8 GiB | 8 GiB | 8.00 GiB | 10 GiB |
+
+At the **8.11 GiB** of free space on `P:` when this was last checked, the same
+three modes resolve as **MAX 6 GiB (clamped), xHIGH 6 GiB (clamped), LOW
+4 GiB** — two of the three rows above state preconditions the volume is not
+currently meeting. MAX does not *starve* here: a mode is an upper bound, so with
+6.11 GiB of headroom it lands on the highest rung that fits, wherever in the
+ladder that happens to be. A granted-tier table with no free-space column is a
+table that goes stale the next time the benchmark runs, which is exactly what
+had happened to this one.
 
 ## Running llama.cpp against it
 
