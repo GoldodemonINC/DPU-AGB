@@ -209,7 +209,15 @@ pub fn main() !void {
     const pfn_enum: *const fn (?*anyopaque, ?*u32, ?[*]?*anyopaque) callconv(.c) c_int =
         @ptrCast(@alignCast(resolveProcAt("vkEnumeratePhysicalDevices", vk) orelse return finish()));
     _ = pfn_enum(vk, &n, null);
-    check(n >= 2, "loader reports {d} physical devices (iGPU + DPU)", .{n});
+    // Enumeration has to return something before the loop below can look for
+    // the DPU inside it. It deliberately does *not* require a second device:
+    // this probe tests the DPU, and how many other ICDs the host happens to
+    // have installed is none of its business. Asserting `n >= 2` made the gate
+    // quietly depend on someone else's Intel iGPU driver being present, so it
+    // exited 1 whenever the DPU was the only ICD -- and would do the same on
+    // every AMD or NVIDIA box, and on any CI runner. Whether the DPU itself is
+    // there is decided below, by vendor and device ID.
+    check(n >= 1, "loader enumerates {d} physical device(s)", .{n});
 
     var devices: [8]?*anyopaque = undefined;
     if (n > devices.len) n = devices.len;
@@ -293,6 +301,31 @@ pub fn main() !void {
     // Sanity-check the device resolver before trusting it with 20 entry points.
     check(vkGetDeviceProcAddrPtr != null and
         vkGetDeviceProcAddrPtr.?(device, "vkCmdWriteBuffer") != null, "vkGetDeviceProcAddr resolves a device-scope command", .{});
+
+    // The rest of this probe resolves entry points through `devProc`, which
+    // falls back to the DPU's own table whenever the loader declines. That
+    // fallback is precisely what hid the `vkQueueSubmit` ABI defect: the probe
+    // called the entry point in the same wrong shape the ICD implemented, so the
+    // two agreed and the gate stayed green while a conformant client got
+    // `VK_SUCCESS` for work that was thrown away.
+    //
+    // Assert up front that the *loader* routes the commands this probe leans
+    // on. If one of them can only be satisfied by a direct call into the ICD,
+    // every "it works" below it is really a claim about the ICD alone, and that
+    // should be a visible failure rather than a silent downgrade.
+    if (vkGetDeviceProcAddrPtr != null) {
+        const must_route_loader = [_][:0]const u8{
+            "vkQueueSubmit", "vkCmdCopyBuffer", "vkCmdFillBuffer", "vkWaitForFences",
+        };
+        var unrouted: usize = 0;
+        for (must_route_loader) |nm| {
+            if (vkGetDeviceProcAddrPtr.?(device, nm.ptr) == null) {
+                unrouted += 1;
+                std.debug.print("       loader does not route {s}\n", .{nm});
+            }
+        }
+        check(unrouted == 0, "the loader routes the entry points this probe depends on ({d} unrouted)", .{unrouted});
+    }
 
     const pfn_getqueue: *const fn (c.VkDevice, u32, u32, ?*c.VkQueue) callconv(.c) void =
         @ptrCast(@alignCast(devProc("vkGetDeviceQueue", device, dpu_dev) orelse return finish()));
@@ -447,21 +480,22 @@ pub fn main() !void {
     var fci: c.VkFenceCreateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     check(pfn_fence(device, &fci, null, @ptrCast(&fence)) == 0 and fence != null, "vkCreateFence -> success", .{});
 
-    const pfn_submit: *const fn (c.VkQueue, u32, ?*const c.VkSubmitInfo, c.VkFence) callconv(.c) c_int =
+    // The loader's real vkQueueSubmit: eight arguments, command buffers passed
+    // directly, and no fence. `probe.zig` used to declare a four-argument form
+    // carrying a VkSubmitInfo and a fence -- a signature that exists nowhere in
+    // the specification -- and `exec.zig` implemented that same invented shape.
+    // The two agreed with each other, so every check below passed while the
+    // entry point was unusable by an actual client. Declared from the spec.
+    const pfn_submit: *const fn (c.VkQueue, u32, ?[*]const c.VkSemaphore, ?[*]const c.VkFence, u32, ?[*]const ?*anyopaque, u32, ?[*]const c.VkSemaphore) callconv(.c) c_int =
         @ptrCast(@alignCast(devProc("vkQueueSubmit", device, dpu_dev) orelse return finish()));
-    var si: c.VkSubmitInfo = .{
-        .sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &cmd,
-    };
     const start = tickMs();
-    const sub = pfn_submit(queue, 1, &si, fence);
+    const sub = pfn_submit(queue, 0, null, null, 1, @ptrCast(&cmd), 0, null);
     const elapsed_ms = tickMs() - start;
     check(sub == 0, "vkQueueSubmit -> success ({d}), {d} ms", .{ sub, elapsed_ms });
 
-    const pfn_wait: *const fn (c.VkDevice, ?[*]const c.VkFence, c.VkBool32, u64) callconv(.c) c_int =
+    const pfn_wait: *const fn (c.VkDevice, u32, ?[*]const c.VkFence, c.VkBool32, u64) callconv(.c) c_int =
         @ptrCast(@alignCast(devProc("vkWaitForFences", device, dpu_dev) orelse return finish()));
-    const wrc = pfn_wait(device, @ptrCast(&fence), 0, 10_000_000_000);
+    const wrc = pfn_wait(device, 1, @ptrCast(&fence), c.VK_TRUE, 10_000_000_000);
     check(wrc == 0, "vkWaitForFences -> success ({d})", .{wrc});
 
     // ----------------------------------------- 6. verify against the disk
@@ -513,13 +547,13 @@ pub fn main() !void {
     std.debug.print("\n7. read back through the driver\n", .{});
     check(pfn_begin(cmd, &cbbi) == 0, "vkBeginCommandBuffer (round 2)", .{});
 
-    const pfn_copy: *const fn (c.VkCommandBuffer, c.VkBuffer, c.VkBuffer, ?*const c.VkBufferCopy, u32) callconv(.c) void =
+    const pfn_copy: *const fn (c.VkCommandBuffer, c.VkBuffer, c.VkBuffer, u32, ?*const c.VkBufferCopy) callconv(.c) void =
         @ptrCast(@alignCast(devProc("vkCmdCopyBuffer", device, dpu_dev) orelse return finish()));
     var region: c.VkBufferCopy = .{ .srcOffset = 0, .dstOffset = 0, .size = PAYLOAD };
-    pfn_copy(cmd, dev_buf, vbuf, &region, 1);
+    pfn_copy(cmd, dev_buf, vbuf, 1, &region);
     _ = pfn_end(cmd);
-    check(pfn_submit(queue, 1, &si, fence) == 0, "vkQueueSubmit (copy back) -> success", .{});
-    _ = pfn_wait(device, @ptrCast(&fence), 0, 10_000_000_000);
+    check(pfn_submit(queue, 0, null, null, 1, @ptrCast(&cmd), 0, null) == 0, "vkQueueSubmit (copy back) -> success", .{});
+    _ = pfn_wait(device, 1, @ptrCast(&fence), c.VK_TRUE, 10_000_000_000);
 
     var round_trip_bad: usize = 0;
     for (0..check_bytes / 4) |k| {
@@ -543,17 +577,17 @@ pub fn main() !void {
     check(pfn_begin(cmd, &cbbi) == 0, "vkBeginCommandBuffer (fill)", .{});
     pfn_fill(cmd, dev_buf, 0, PAYLOAD, FILL);
     _ = pfn_end(cmd);
-    check(pfn_submit(queue, 1, &si, fence) == 0, "vkQueueSubmit (fill) -> success", .{});
-    _ = pfn_wait(device, @ptrCast(&fence), 0, 10_000_000_000);
+    check(pfn_submit(queue, 0, null, null, 1, @ptrCast(&cmd), 0, null) == 0, "vkQueueSubmit (fill) -> success", .{});
+    _ = pfn_wait(device, 1, @ptrCast(&fence), c.VK_TRUE, 10_000_000_000);
 
     // Read it back through the driver rather than trusting the submit status,
     // which is the whole lesson of this file: a path that writes nothing still
     // returns VK_SUCCESS.
     check(pfn_begin(cmd, &cbbi) == 0, "vkBeginCommandBuffer (fill readback)", .{});
-    pfn_copy(cmd, dev_buf, vbuf, &region, 1);
+    pfn_copy(cmd, dev_buf, vbuf, 1, &region);
     _ = pfn_end(cmd);
-    check(pfn_submit(queue, 1, &si, fence) == 0, "vkQueueSubmit (fill readback) -> success", .{});
-    _ = pfn_wait(device, @ptrCast(&fence), 0, 10_000_000_000);
+    check(pfn_submit(queue, 0, null, null, 1, @ptrCast(&cmd), 0, null) == 0, "vkQueueSubmit (fill readback) -> success", .{});
+    _ = pfn_wait(device, 1, @ptrCast(&fence), c.VK_TRUE, 10_000_000_000);
 
     var fill_bad: usize = 0;
     for (0..check_bytes / 4) |k| {

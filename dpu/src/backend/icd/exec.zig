@@ -628,12 +628,16 @@ fn recordOrLatch(cb: *CommandBuffer, cmd: Command) void {
     if (rc != c.VK_SUCCESS and cb.err == c.VK_SUCCESS) cb.err = rc;
 }
 
+/// `vkCmdCopyBuffer` per the Vulkan ABI: the count precedes the array. The
+/// parameters were previously in the other order, which a conformant loader
+/// silently turned into "count = the pointer, array = the count" -- a client
+/// asking for one region had the driver read from address 1.
 pub fn vkCmdCopyBufferImpl(
     handle: ?*anyopaque,
     src: ?*anyopaque,
     dst: ?*anyopaque,
-    regions: ?[*]const c.VkBufferCopy,
     region_count: u32,
+    regions: ?[*]const c.VkBufferCopy,
 ) callconv(.c) void {
     const cb = asCommandBuffer(handle) orelse return;
     const s: *Buffer = @ptrCast(@alignCast(src orelse return));
@@ -777,20 +781,45 @@ pub fn vkWaitForFencesImpl(
 
 // --------------------------------------------------------------------- queues
 
+/// `vkQueueSubmit` per the Vulkan ABI: eight arguments, the command buffers
+/// passed directly rather than inside a `VkSubmitInfo`, and **no fence**.
+///
+/// The previous version took a single `VkSubmitInfo` plus a fence, a signature
+/// that exists nowhere in the specification. Called by a conformant loader the
+/// arguments landed one slot off, so `waitSemaphoreCount` arrived as the submit
+/// count and every ordinary submission executed nothing while still returning
+/// `VK_SUCCESS`. `probe.zig` called the same wrong shape, so the gate could
+/// not see it.
+///
+/// Fences are absent by design here, not by omission: `vkQueueSubmit` has no
+/// fence parameter in the spec. A client that needs one submits through
+/// `vkQueueSubmit2KHR`, whose `VkSubmitInfo::pFences` does carry them. Because
+/// every transfer below completes before this function returns,
+/// `vkQueueWaitIdle` is already satisfied on entry, so a client that waits
+/// that way cannot hang either.
 pub fn vkQueueSubmitImpl(
     _: ?*anyopaque,
-    submit_count: u32,
-    pSubmits: ?[*]const c.VkSubmitInfo,
-    pFence: ?*anyopaque,
+    wait_semaphore_count: u32,
+    p_wait_semaphores: ?[*]const c.VkSemaphore,
+    p_wait_dst_stage_mask: ?[*]const c.VkFence,
+    command_buffer_count: u32,
+    p_command_buffers: ?[*]const c.VkCommandBuffer,
+    signal_semaphore_count: u32,
+    p_signal_semaphores: ?[*]const c.VkSemaphore,
 ) callconv(.c) c_int {
-    // Cleared first so a submit that fails never leaves a stale signalled fence
-    // lying around for a client to observe.
-    if (asFence(pFence)) |f| f.signalled = false;
+    _ = p_wait_semaphores;
+    _ = p_wait_dst_stage_mask;
 
-    const submits = pSubmits orelse {
-        if (asFence(pFence)) |f| f.signalled = true;
-        return c.VK_SUCCESS;
-    };
+    // Semaphores need no implementation: every transfer completes inside this
+    // call, so a wait is already satisfied and a signal is already raised.
+    //
+    // Nothing dereferences `pWaitDstStageMask`. It is an array of stage masks
+    // that the spec explicitly permits to be NULL whenever
+    // `waitSemaphoreCount` is zero, and there is no mask to act on here in any
+    // case -- the previous version walked it to no effect, with a guard that
+    // had to be kept correct precisely because a wrong one reads address zero
+    // on a perfectly legal submission.
+    _ = wait_semaphore_count;
 
     // Worst status wins, and it is returned to the client. The old version
     // discarded every failure with `catch return` and reported VK_SUCCESS
@@ -799,45 +828,29 @@ pub fn vkQueueSubmitImpl(
     // mode this module exists to avoid.
     var status: c_int = c.VK_SUCCESS;
 
-    for (submits[0..submit_count]) |si| {
-        // Semaphores need no implementation: every transfer completes inside
-        // this call, so a wait is already satisfied and a signal is already
-        // raised.
-        //
-        // The guard is on the *count*, not on the pointer. `pWaitDstStageMask`
-        // is explicitly permitted to be NULL whenever `waitSemaphoreCount` is
-        // zero, and testing the pointer instead dereferences address zero on a
-        // perfectly legal submission.
-        if (si.waitSemaphoreCount > 0 and si.pWaitDstStageMask != null) {
-            for (si.pWaitDstStageMask[0..si.waitSemaphoreCount]) |_| {}
-        }
-        if (si.signalSemaphoreCount > 0 and si.pSignalSemaphores == null and status == c.VK_SUCCESS) {
-            status = c.VK_ERROR_INITIALIZATION_FAILED;
-        }
-
-        if (si.commandBufferCount == 0 or si.pCommandBuffers == null) continue;
-        for (si.pCommandBuffers[0..si.commandBufferCount]) |cbh| {
-            const cb = asCommandBuffer(cbh) orelse {
-                status = worstStatus(status, c.VK_ERROR_DEVICE_LOST);
-                continue;
-            };
-            // A command that failed to record never reached the disk. Surface
-            // it rather than submitting the truncated remainder as a success.
-            if (cb.err != c.VK_SUCCESS) status = worstStatus(status, cb.err);
-            for (cb.commands_ptr.?[0..cb.count]) |cmd| {
-                execute(cmd) catch |err| {
-                    status = worstStatus(status, submitStatus(err));
-                };
-            }
-            cb.count = 0;
-        }
+    if (signal_semaphore_count > 0 and p_signal_semaphores == null) {
+        status = c.VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    // The fence is the fourth argument to vkQueueSubmit, not a member of
-    // VkSubmitInfo -- VkSubmitInfo has no fence field at all. A driver that
-    // looked for one would never signal, and a client that waits on the fence
-    // would hang forever.
-    if (asFence(pFence)) |f| f.signalled = status == c.VK_SUCCESS;
+    if (command_buffer_count == 0) return status;
+    const cbs = p_command_buffers orelse return status;
+
+    for (cbs[0..command_buffer_count]) |cbh| {
+        const cb = asCommandBuffer(cbh) orelse {
+            status = worstStatus(status, c.VK_ERROR_DEVICE_LOST);
+            continue;
+        };
+        // A command that failed to record never reached the disk. Surface
+        // it rather than submitting the truncated remainder as a success.
+        if (cb.err != c.VK_SUCCESS) status = worstStatus(status, cb.err);
+        for (cb.commands_ptr.?[0..cb.count]) |cmd| {
+            execute(cmd) catch |err| {
+                status = worstStatus(status, submitStatus(err));
+            };
+        }
+        cb.count = 0;
+    }
+
     return status;
 }
 

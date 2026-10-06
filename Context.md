@@ -524,13 +524,175 @@ does 7.54 tok/s on the 3B and 2.51 tok/s on the 9B.
 
 The code is kept because the measurement is reusable and `dputest` is a real
 test -- 21/21 with the pool on, 3/3 with it off -- not because it is the route
-to an 8B model. The route to one is a compute path the ICD does not have: of the
-fourteen entry points a Vulkan compute client needs,
-`vkCreateShaderModule` and `vkCreateComputePipelines` are present and refused,
-and the other twelve -- `vkCmdDispatch`, every descriptor-set entry point,
-`vkCreatePipelineLayout` -- are absent from `src/backend/icd/icd.zig`.
+to an 8B model. The route to one is a compute path the ICD does not have, and
+that used to be an inference from reading `src/backend/icd/icd.zig`. It is now
+measured, through the real loader, with the iGPU as a control on the same run:
+
+| asked of the loader | Intel UHD (control) | DPU |
+| --- | --- | --- |
+| device extensions advertised | 130 | **0** |
+| `VK_KHR_buffer_device_address` | YES | **NO** |
+| compute entry points that resolve | 10 of 16 | **2 of 16** |
+| `vkCreateShaderModule` (valid SPIR-V) | `VK_SUCCESS` | **`VK_ERROR_FEATURE_NOT_PRESENT` (-8)** |
+| `vkCreatePipelineLayout` (empty) | `VK_SUCCESS` | **NULL, never called** |
+| `vkCreateComputePipelines` (1) | `VK_SUCCESS` | NULL, never reached |
+
+The two entry points DPU resolves are exactly the two it refuses with a
+definite status; the other fourteen are NULL, so a client dereferences a crash
+rather than a diagnosable error. `vkCmdDispatch`, every descriptor-set entry
+point and `vkCreatePipelineLayout` are among them. Advertising **zero**
+extensions is separately fatal on its own: without buffer device address there
+is no way to hand a buffer address to a shader at all, so `ggml-vulkan` stops
+before it reaches a pipeline. The control matters -- the same probe, the same
+loader and the same battery produce three `VK_SUCCESS` on a real compute-capable
+ICD, so the refusals belong to the DPU rather than to the harness.
+
+Two related defects fall out of the same run. `vk_icd.json` declares
+`"api_version":"1.3"` but the ICD does not implement
+`vkEnumerateInstanceVersion`, so the loader logs `treating as a 1.0 ICD`; the
+device property still reports 1.3.0 because DPU fills it in directly. And the
+loader finds the iGPU's ICD in the DriverStore
+(`...\iigd_dch.inf_amd64_...\igvk64.json`) by enumerating display devices, not
+through `HKLM\SOFTWARE\Khronos\Vulkan\Drivers`, which is empty -- so the
+absence of registered drivers on this machine does not mean the absence of
+Vulkan hardware.
+
+### `vkQueueSubmit` did not implement the Vulkan ABI (fixed)
+
+This is the more serious finding, and it is not a compute-only problem: it
+affects every submission the DPU ever receives.
+
+`dpu/third_party/vulkan/vulkan_core.h` declares
+
+```c
+VkResult vkQueueSubmit(VkQueue, uint32_t submitCount,
+                       const VkSubmitInfo*, VkFence fence);
+```
+
+and drops `VkSubmitInfo::pFences` entirely. No such function exists. The real
+`vkQueueSubmit` takes eight arguments and **has no fence parameter at all**;
+the fence lives in `VkSubmitInfo::pFences`, and `VkSubmitInfo` is the struct
+`vkQueueSubmit2KHR` takes, not `vkQueueSubmit`. The header had also given
+`vkQueueSubmit2` and `vkQueueSubmit2KHR` an invented four-argument form --
+`vkQueueSubmit2KHR` even took a `VkSubmitInfo2` where the spec says
+`VkSubmitInfo`, which is why `VkSubmitInfo` sat in the header referenced by
+nothing. `vkQueueSubmitImpl` in `src/backend/icd/exec.zig` followed the header.
+Its comment asserts that "VkSubmitInfo has no fence field at all", which is the
+misconception that produced the bug.
+
+`src/backend/icd/probe.zig` then *calls* it with the same four arguments
+(`pfn_submit(queue, 1, &si, fence)`), so the probe and the ICD agree with each
+other and the gate reports 50/50. Two errors that cancel.
+
+`probe.zig` independently mistranscribed `vkCmdCopyBuffer` and `vkWaitForFences`
+the same way, and `vkCmdCopyBufferImpl` had `regionCount` and `pRegions` the
+wrong way round, so a conformant client asking for one region had the driver
+read from address 1. Every other pointer/count pair in the execution layer was
+compared against the header and matches -- `vkWaitForFences`, `vkResetFences`,
+`vkCmdFillBuffer`, `vkBindBufferMemory2`, `vkGetBufferMemoryRequirements2`, the
+flush/invalidate pair, `vkQueueBindSparse`, `vkFreeCommandBuffers`,
+`vkAllocateCommandBuffers` -- so the divergence was confined to these two entry
+points.
+
+Submitted through the genuine loader with the spec's eight arguments, the DPU
+behaves exactly as that mismatch predicts:
+
+| observation | value | what the code predicts |
+| --- | --- | --- |
+| `vkQueueSubmit` (spec ABI) | `VK_SUCCESS` | returns success without doing anything |
+| `vkGetFenceStatus` | **0, not signalled** | `asFence(pFence)` sees the 4th argument, which is `pWaitDstStageMask`, and I passed NULL |
+| staging buffer after the wait | all zeros | `submit_count` reads `waitSemaphoreCount` = 0, so the loop never runs |
+| `P:\DPU\pool.vram` | unmodified, same size and mtime | no command buffer reached the pool |
+
+So a conformant client gets `VK_SUCCESS` for work that is silently discarded,
+and no fence ever signals. This is the same failure mode the probe's own
+comment warns about -- "a client that waits on the fence would hang forever" --
+arriving by a different route than the author expected.
+
+**Control caveat, stated because it matters.** The intent was to prove this
+against the iGPU as a live control, and the control did not validate: on the
+Intel UHD the same harness's fence waits time out at both 5 s and 60 s, and the
+filled buffer reads back as zeros. That machine's Intel driver is 31.0.101.5522
+and the loader does drive it correctly for instance, device and pipeline
+creation, but its submission path did not behave, so the iGPU cannot serve as
+evidence here. The finding above therefore rests on the DPU's own measured
+behaviour plus the code, not on a differential A/B against a healthy driver.
+The four observations are each predicted independently by the argument
+mismatch, which is what makes the conclusion stronger than the missing
+control -- but a working control is still owed.
+
+**Fixed.** `vulkan_core.h` now carries the spec's `VkSubmitInfo` (member order
+restored, `pFences` present) and the real three- and eight-argument
+`vkQueueSubmit`, `vkQueueSubmit2` and `vkQueueSubmit2KHR`;
+`vkQueueSubmitImpl` takes the eight arguments and executes the command buffers
+passed to it; `vkCmdCopyBufferImpl` takes `regionCount` before `pRegions`; and
+`probe.zig` declares `vkQueueSubmit`, `vkCmdCopyBuffer` and `vkWaitForFences`
+from the spec rather than from the header's mistakes.
+
+Measured before and after with the same harness, submitting through the genuine
+loader with the spec's eight arguments and reading the bytes back:
+
+| | before | after |
+| --- | --- | --- |
+| `vkQueueSubmit` (spec ABI) | `VK_SUCCESS` | `VK_SUCCESS` |
+| staging readback | 0 of 65536 == 0xAB, all zeros | **65536 of 65536 == 0xAB**, 0 zero |
+| harness verdict | "NOT executed", exit 5 | **"EXECUTED", exit 0** |
+| `zig build check` | 13/13 steps, 111/111 tests | 13/13 steps, 111/111 tests |
+| `zig build probe` | 50/50 | 51/51 |
+
+The probe staying at 50/50 is the point: it passed before *and* after, because
+it used to call the entry point in the same wrong shape the ICD implemented. It
+now exercises the real signature and still passes, so the fix is confirmed on
+the path the gate actually covers.
+
+One stale expectation remains in the harness rather than the driver:
+`vkGetFenceStatus` still reports 0 after a plain `vkQueueSubmit`, and that is
+now correct. `vkQueueSubmit` has no fence parameter, so the fence in that test
+was never part of the submission. A client wanting a fence submits through
+`vkQueueSubmit2KHR`; because every transfer completes before `vkQueueSubmit`
+returns, `vkQueueWaitIdle` is already satisfied for a client that waits that
+way.
 
 ## What comes next
+
+**The guard is now in place, and the probe count went from 50 to 51.** The probe
+resolves entry points through `devProc`, which falls back to the DPU's own table
+whenever the loader declines -- so the probe and the ICD agreed by construction,
+which is how the defect stayed green. A new check asserts that the **loader
+itself** routes `vkQueueSubmit`, `vkCmdCopyBuffer`, `vkCmdFillBuffer` and
+`vkWaitForFences`. It passes with 0 unrouted, which means the byte-identical
+round trips above really are loader-mediated rather than direct calls into the
+ICD, and an entry point that could only be satisfied by a fallback is now a
+visible failure instead of a silent downgrade.
+
+The check has teeth, which matters more than that it passes: adding an entry
+point neither the loader nor the ICD serves reports `1 unrouted`, names it, and
+takes the probe to `50/51` with **exit 1**.
+
+**The probe no longer requires another vendor's driver.** It used to assert the
+loader reported two physical devices, which quietly made the gate depend on an
+Intel iGPU ICD being installed: with `VK_DRIVER_FILES=./vk_icd.json` -- the DPU
+as the only driver -- it reported one device and exited 1, and it would have
+done the same on every AMD or NVIDIA box and on any CI runner. Enumeration is
+now asserted to return at least one device, and whether the DPU is present is
+decided where it always should have been, by vendor and device ID. All four
+cases behave:
+
+| environment | result |
+| --- | --- |
+| DPU only, `VK_DRIVER_FILES=./vk_icd.json` | 51/51, exit 0 |
+| ambient iGPU + DPU, `zig build probe` | 51/51, exit 0 |
+| DPU absent (no `VK_*` set) | exit 1, `the DPU is present` |
+| no ICDs at all | exit 3, `vkCreateInstance -> VK_ERROR_INCOMPATIBLE_DRIVER` |
+
+The third row is the one that keeps this honest. Before the change the same
+run failed on the device *count*, which named the wrong problem; it now fails
+on the check that states the real one -- the DPU was not found -- so relaxing
+the count could not quietly turn the probe into a no-op.
+
+One item from that list is still open: add `vkEnumerateInstanceVersion` so
+`vk_icd.json` can honestly declare 1.3. Without it the loader logs `treating as
+a 1.0 ICD`, because the manifest's declared API version is never confirmed.
 
 1. **Retire #5, #6 and #7.** They are fully contained in #8. Closing them is the
    user's call, not the agent's.
@@ -552,6 +714,14 @@ and the other twelve -- `vkCmdDispatch`, every descriptor-set entry point,
    never written to, so every counter it reports is a zero. The same test with a
    pool that has actually absorbed and read back blocks would cover the sampler
    arithmetic, which nothing in the gate touches today.
+7. **Measure the iGPU baseline -- the one number that decides Route 1.** The
+   iGPU does have a working Vulkan driver (`igvk64.dll`, apiVersion 1.3.280,
+   130 extensions, and it returns `VK_SUCCESS` from `vkCreateComputePipelines`),
+   so the 10-40 TPS target can be measured on hardware rather than argued about
+   from a CPU-only 2.51 tok/s. Building `ggml-vulkan` needs `glslc` and the
+   Vulkan headers, and the SDK install has failed twice (eight unattended
+   attempts, then a manual run that logged `Installation aborted!` and rolled
+   `C:\VulkanSDK` back out). Nothing else is missing.
 
 ## Running things
 
