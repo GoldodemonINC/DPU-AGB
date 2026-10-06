@@ -1018,3 +1018,38 @@ is unchanged between the two branches — the already-corrupted bytes survive th
 switch. The attribute has to be present at the initial checkout, or the test is
 measuring the old checkout. Re-checking out with `rm -rf` and `git checkout --`
 reproduces the good state, which is what makes the failing case look fixed.
+## The documentation was stale in the direction that flatters you
+
+The repository had **no README at all**, and the one under `dpu/` was 197 lines
+of which a material fraction was false. Writing the root one meant checking
+every claim against the code instead of against the previous README, and three
+of them did not survive that:
+
+- **`zig build test` was documented as "33 backend tests".** It is **133**
+  (64 backend + 20 tiers + 29 residency + 20 ICD), and `test-vkabi` is 7, for
+  the 140 `check` reports. The gap was not carelessness about a number; it was
+  two named-module test roots whose tests Zig stopped discovering, thirteen at
+  a time, with nothing going red.
+- **"The ICD is an identity, not an executor... no buffers, no `vkAllocateMemory`,
+  no submits."** Flatly false. `entryLookup` carries **74** entry points across
+  an execution layer of 37 implementations, including every command named
+  there. The error was the interesting kind: it understated the driver, which
+  made the work look further from done than it was, and it had survived because
+  nobody diffed the prose against the table.
+- **The latency paragraph contradicted itself inside four lines** -- `~62-66 µs`
+  and `2370 us` for the same measurement -- because it divided a measured device
+  figure by a hardcoded `0.08 µs`. The corrected figure is **57.6 µs** against
+  **0.100-0.185 µs** for RAM, both measured.
+
+The `AllocationSize` bullet looked like a candidate for deletion and is not
+stale: `blockdev.zig`, `pool.zig` and `bench.zig` all still carry that exact
+finding verbatim. A claim does not go stale because the code moved on; it goes
+stale when the code changes its mind. Checking before deleting is the whole
+lesson, and three claims in six is not a bad rate for prose that nobody had
+re-run since it was written.
+
+So the root `README.md` is built to be checkable rather than persuasive. Every
+count in it is a command's output, every table is a measurement, and the
+9B-at-64k verdict is labelled as a planner prediction over measured device
+constants -- because the 9B has still never been run end to end. The one
+sentence that took the longest to write was the one saying so.

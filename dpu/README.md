@@ -1,6 +1,7 @@
 # DPU — Disk-Dependent Processing Unit
 
-A disk-backed virtual VRAM engine for Windows, in three layers:
+A disk-backed virtual VRAM engine for Windows, in three layers. For the
+repository landing page, see the [root README](../README.md).
 
 | Layer | Module | Job |
 |---|---|---|
@@ -13,15 +14,25 @@ A disk-backed virtual VRAM engine for Windows, in three layers:
 
 ```sh
 zig build            # engine  -> zig-out/bin/dpu.exe
-zig build test       # 33 backend tests (block device + allocator + tiers)
+zig build test       # 133 tests: block device, allocator, tiers, residency, ICD
 zig build test-vkabi # 7 assertions about the vendored Vulkan headers
 zig build icd        # -> zig-out/bin/{dpu_icd.dll, vk_icd.json, dpu-vulkan.cmd}
 zig build bench      # real flushed device throughput against P:\
 zig build run        # engine + dashboard
+zig build probe      # load the real Vulkan loader and verify the DPU enumerates
+zig build check      # the gate: fmt, 140 tests, ABI assertions, both binaries
 ```
 
 The dashboard is at `http://127.0.0.1:8787`. The capacity pool is optional: if
 `P:\` is missing the engine still boots and simply reports no buffer.
+
+`zig build check` is the gate, and it currently reports **17/17 steps,
+140/140 tests, exit 0**. It builds both shipped binaries -- `dpu.exe` and
+`dpubench` -- so a green run means the artifacts people actually run compile,
+not merely that the tests compiled. It used not to: a local `const` shadowed a
+top-level `fn`, so `zig build bench` had stopped compiling while the gate stayed
+green. `probe` is the honest test: **61/61, exit 0**, against the real loader,
+with no loader warnings at all.
 
 ## The capacity tier ladder
 
@@ -159,37 +170,48 @@ So the honest summary:
 
 ## Current limits, stated plainly
 
-- **The ICD is an identity, not an executor.** It enumerates and reports; it
-  stops at `vkGetDeviceQueue`. There are no buffers, no `vkAllocateMemory`, no
-  submits — `vkGetDeviceProcAddr` returns null for those. An application that
-  picks the DPU and then asks for a buffer will get a clean failure, not a
-  crash, but it will not get work done. This is the honest current state: the
-  device is discoverable, the plumbing underneath it is not built yet.
+- **The ICD executes; it does not shade.** The entry table carries **74 entry
+  points**, and the execution layer underneath is real: `vkAllocateMemory`,
+  `vkCreateBuffer`, `vkBindBufferMemory`, command pools and command buffers,
+  fences, `vkCmdCopyBuffer`, `vkCmdFillBuffer`, `vkCmdWriteBuffer`,
+  `vkCmdPipelineBarrier`, `vkQueueSubmit`, `vkQueueWaitIdle`,
+  `vkQueueBindSparse`, and `vkMapMemory`. The copy path moves real bytes between
+  buffers backed by real bytes in `pool.vram`, and `probe` asserts that end to
+  end. What is missing is shading: `vkCreateComputePipelines` and
+  `vkCreateGraphicsPipelines` exist and refuse with a definite status rather
+  than pretending to work. There are no formats either. An earlier version of
+  this file claimed the ICD stopped at `vkGetDeviceQueue` with "no buffers, no
+  `vkAllocateMemory`, no submits"; that was stale, and it was stale in the
+  direction of understating what the driver does.
 - **Device and driver UUIDs are all zeros.** llama.cpp keys some caches off
   them; worth filling in with something stable and DPU-specific.
 - **`AllocationSize` is not a usable committed-bytes measure on this volume.**
   After writing 256 MiB it reported 31 MiB, with every byte intact. It is shown
   for information only and is never used as a correctness signal.
-- **Latency numbers below ~2 GiB are cache, not disk.** The volume sits behind a
-  RAID controller. Under ~2 GiB working set you are measuring the controller
-  cache (3–6 µs random, ~4 GB/s read). At 8 GiB the device numbers are
-  ~295–385 MB/s write, ~377–487 MB/s read, ~62–66 µs random 4 KiB read — roughly
-  4000× worse than RAM -- and that ratio is now measured on both
-  sides rather than quoted. The benchmark chases dependent pointers through
-  a 256 MiB buffer for the RAM half (0.587 us/access on this machine) and
-  times uncached 4 KiB reads at an 8 GiB working set for the pool half
-  (2370 us), then divides the two. It used to print `67.3 / 0.08`, dividing
-  a measured device figure by a hardcoded 0.08 us that nothing in this
-  project ever measured, and this sentence repeated the resulting number
-  as fact. Quote the 8 GiB figures; the small ones are noise.
+- **Latency numbers below ~2 GiB working set are the RAID controller's cache,
+  not the disk.** `P:` is an NVMe behind a controller with a large cache: about
+  4 GB/s under a 2 GiB set, falling to 400–500 MB/s once the set passes 4 GiB.
+  The device figures are **~57.6 µs** for a random 4 KiB read against
+  **0.100–0.185 µs** for RAM — 312× to 576× — and both sides are now measured
+  rather than quoted. An earlier version of this file contradicted itself
+  exactly here, claiming ~62–66 µs in one sentence and 2370 µs in the next,
+  because it divided a measured device figure by a hardcoded 0.08 µs that
+  nothing in this project ever measured and then repeated the quotient as
+  fact. Quote the device figures; the small ones are noise.
+- **The read granule is the largest untaken lever.** A granule sweep at a 4 GiB
+  working set with one read in flight measured 78–107 MB/s at 36–51 µs for a
+  4 KiB granule against 443–580 MB/s for 1 MiB — **~5.4× from the granule
+  alone**, at identical device constants. Run-to-run variance is real here: the
+  controller's cache moves the cold boundary between 2 and 4 GiB.
 
 ## Layout
 
 ```
 src/backend/blockdev.zig   uncached write-through block I/O, 4 KiB sectors
 src/backend/alloc.zig      bump + reclaim free-list allocator with a VAT
+src/backend/residency.zig  paging policy and the feasibility planner
 src/backend/tiers.zig      the ladder, resolve(), and the tier.cfg format
-src/backend/icd/icd.zig    the Vulkan ICD
+src/backend/icd/           the ICD: icd.zig, exec.zig, probe.zig
 src/pool.zig               facade: ceiling policy, publishTier
 src/server.zig             dashboard HTTP + telemetry
 web/                       the dashboard (compiled into the executable)
