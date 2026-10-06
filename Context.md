@@ -75,6 +75,24 @@ Nothing about the backend's *code* depends on #18; that was measured rather than
 assumed, and the GL section below has the two worktree results that show it.
 Auto-merge is off on #19: it sits open for review.
 
+**A stacked base costs the automatic review, and this was not known until it
+happened.** The repository's automated reviewer is **CodeRabbit** (the
+`coderabbitai[bot]` account), not Greptile. Its automatic review is disabled on
+any base branch that is not the default, so #19 -- based on
+`feat/granule-fault-path` -- was opened and immediately answered with
+`Review skipped: Auto reviews are disabled on base/target branches other than the
+default branch`. A single review was triggered with `@coderabbitai review`
+instead, which is the command the skip message itself names. That engages the
+gate without changing the diff; the alternatives were worse -- targeting `main`
+would put #18's 865 lines into a PR about the OpenGL backend, and adding a
+`.coderabbit.yaml` to allow non-default bases is a change to the repository's
+review policy, which is the owner's call rather than this branch's.
+
+**The lesson mirrors the one about pushes.** "The PR is open" is not the same as
+"the PR is being reviewed"; the review tool declined in a comment, and a process
+that only checked that the PR existed would have waited forever for feedback that
+was never coming.
+
 **Every one of #5 to #10 is now merged**, along with #11, #12 and #13. The linear
 stack they were blocked on resolved in the order it was predicted to: #8, then
 #9, then #10, then #11, #12, #13.
